@@ -44,7 +44,9 @@ time.sleep(10)
 #if date not in sheets_list :
  #   xw.sheets.add(date)
 
-for comic_num in range(2,572):
+last_row = sheet.range('A' + str(sheet.cells.last_cell.row)).end('up').row + 1
+
+for comic_num in range(2,last_row):
     try:
         # Navigating to search page
         if(driver.current_url != "https://comicspriceguide.com/Search"):
