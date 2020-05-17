@@ -31,9 +31,6 @@ dfResults = pd.DataFrame(columns = ['title','issue','grade','cgc','publisher',
                                     'cover_price','price','comic_age','notes',
                                     'characters_info','story','url_link'])
 
-def getDetails(row):
-    return sheet.range("A"+str(row)+":J"+str(row)).value
-    
 
 driver.get("https://comicspriceguide.com/login")
 
@@ -57,8 +54,6 @@ time.sleep(10)
 #if date not in sheets_list :
  #   xw.sheets.add(date)
 
-#for comic_num in range(2,572):
-
 for comic_num in sheet.iterrows():
     try:
         # Navigating to search page
@@ -74,8 +69,6 @@ for comic_num in sheet.iterrows():
         button_search_submit = driver.find_element_by_id("btnSearch")
 
         # Get the Comic
-        Publisher = comic_num[1][0]
-        Title = comic_num[1][1]
         comic = comic_num[1].to_list()
                 
         # Appending the title to the end of list. Example, "The Amazing Spider-Man #101"
@@ -99,7 +92,6 @@ for comic_num in sheet.iterrows():
 
         # Wait for 20 seconds for results to show up
         time.sleep(12)
-
 
         # Source Code of the search result page.
         source_code = driver.page_source
@@ -190,20 +182,17 @@ for comic_num in sheet.iterrows():
                                      'characters_info':characters_info,
                                      'story':story,
                                      'url_link':url_link}, ignore_index=True)
-        data = [title,issue,grade,cgc,publisher,volume,published,keyIssue,price_paid,cover_price,price,comic_age,notes,characters_info,story,url_link]
-        sys.exit()
-    # The sheet to put data into
-        #new_sheet = workbook.sheets["Sorted"]
-        #new_sheet.range("A" + str(comic_num) + ":P" + str(comic_num)).value = data
-        #workbook.save()
+
         
     except Exception as e:
         print("Oops there was an error." + str(e))
-        data = ["ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR",str(e),"ERROR"]
-        # new_sheet = workbook.sheets["Sorted"]
-        #new_sheet.range("A" + str(comic_num) + ":P" + str(comic_num)).value = data
+        dfResults = dfResults.append({'title' : comic_num[1][1],
+                                      'issue' : comic_num[1][3],
+                                      'grade': comic_num[1][4],
+                                      'cgc': comic_num[1][5]}, ignore_index=True)
+        driver.get("https://comicspriceguide.com/Search")
         continue
 
 writer = ExcelWriter(ExcelWorkbookName)    
-dfResults.to_excel(writer,'Results')
+dfResults.to_excel(writer,date.today().strftime("%Y-%m-%d"))
 print("Work is complete.")
