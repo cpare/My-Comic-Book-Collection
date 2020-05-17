@@ -163,12 +163,14 @@ for comic_num in range(2,572):
         new_sheet = workbook.sheets["Sorted"]
         new_sheet.range("A" + str(comic_num) + ":P" + str(comic_num)).value = data
         workbook.save()
-        
+
     except Exception as e:
         print("Oops there was an error.")
         data = ["ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR",str(e),"ERROR"]
         new_sheet = workbook.sheets["Sorted"]
         new_sheet.range("A" + str(comic_num) + ":P" + str(comic_num)).value = data
+        new_sheet.range("A" + str(comic_num) + ":P" + str(comic_num)).api.Font.Bold = True
+        driver.get("https://comicspriceguide.com/Search")
         continue
 
 Print("Work is complete.")
