@@ -1,22 +1,35 @@
 from selenium import webdriver
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.by import  By
-import xlwings as xw
+#import xlwings as xw
 from pprint import pprint
 import bs4
 import time
 from difflib import SequenceMatcher
 from datetime import date
+import pandas as pd
+import sys
+import xlrd
+import numpy
 
 def similar(a, b):
     return SequenceMatcher(None, a, b).ratio()
 
 driver = webdriver.Chrome()
 driver.maximize_window()
-workbook = xw.Book("Comics.xlsx")
-sheet = workbook.sheets['My Collection']
+#workbook = xw.Book("Comics.xlsx")
+#sheet = workbook.sheets['My Collection']
 
+ExcelWorkbookName = 'Comics.xlsx'
 
+sheet = pd.read_excel(open(ExcelWorkbookName, 'rb'),
+              sheet_name='My Collection')
+
+# Create an empty Dataframe
+dfResults = pd.DataFrame(columns = ['title','issue','grade','cgc','publisher',
+                                    'volume','published','keyIssue','price_paid',
+                                    'cover_price','price','comic_age','notes',
+                                    'characters_info','story','url_link'])
 
 def getDetails(row):
     return sheet.range("A"+str(row)+":J"+str(row)).value
@@ -44,9 +57,9 @@ time.sleep(10)
 #if date not in sheets_list :
  #   xw.sheets.add(date)
 
-last_row = sheet.range('A' + str(sheet.cells.last_cell.row)).end('up').row + 1
+#for comic_num in range(2,572):
 
-for comic_num in range(2,last_row):
+for comic_num in sheet.iterrows():
     try:
         # Navigating to search page
         if(driver.current_url != "https://comicspriceguide.com/Search"):
@@ -61,8 +74,10 @@ for comic_num in range(2,last_row):
         button_search_submit = driver.find_element_by_id("btnSearch")
 
         # Get the Comic
-        comic = getDetails(comic_num)
-
+        Publisher = comic_num[1][0]
+        Title = comic_num[1][1]
+        comic = comic_num[1].to_list()
+                
         # Appending the title to the end of list. Example, "The Amazing Spider-Man #101"
         comic.append(comic[1].upper() + " #" + str(comic[3]))
 
@@ -75,7 +90,7 @@ for comic_num in range(2,last_row):
         time.sleep(1)
 
         # If the issue of the comic has any alphabet in it, then remove it and then search.
-        if not str(comic[3]).isdigit():
+        if not str(comic[3]).isdigit(): 
             input_search_issue.send_keys(str(comic[3][:-1]))
         else: 
             input_search_issue.send_keys(str(comic[3]))
@@ -155,24 +170,40 @@ for comic_num in range(2,last_row):
         story = soup.find('div',attrs={'id':'dvStoryList'}).text.replace("Stories may contain spoilers","")
         url_link = driver.current_url
 
-    # Uncomment below to debug
-    #print(publisher,title,volume,issue,grade,cgc,notes,price_paid,published,comic_age,cover_price,price,characters_info,story)
+        # Uncomment below to debug
+        #print(publisher,title,volume,issue,grade,cgc,notes,price_paid,published,comic_age,cover_price,price,characters_info,story)
 
-    # Data to be put into excel file
+        # Data to be put into excel file
+        dfResults = dfResults.append({'title' : title,
+                                      'issue' : issue,
+                                      'grade':grade,
+                                      'cgc':cgc,
+                                      'publisher':publisher,
+                                      'volume':volume,
+                                      'published':published,
+                                      'keyIssue':keyIssue,
+                                     'price_paid':price_paid,
+                                     'cover_price':cover_price,
+                                     'price':price,
+                                     'comic_age':comic_age,
+                                     'notes':notes,
+                                     'characters_info':characters_info,
+                                     'story':story,
+                                     'url_link':url_link}, ignore_index=True)
         data = [title,issue,grade,cgc,publisher,volume,published,keyIssue,price_paid,cover_price,price,comic_age,notes,characters_info,story,url_link]
-
+        sys.exit()
     # The sheet to put data into
-        new_sheet = workbook.sheets["Sorted"]
-        new_sheet.range("A" + str(comic_num) + ":P" + str(comic_num)).value = data
-        workbook.save()
-
+        #new_sheet = workbook.sheets["Sorted"]
+        #new_sheet.range("A" + str(comic_num) + ":P" + str(comic_num)).value = data
+        #workbook.save()
+        
     except Exception as e:
-        print("Oops there was an error.")
+        print("Oops there was an error." + str(e))
         data = ["ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR","ERROR",str(e),"ERROR"]
-        new_sheet = workbook.sheets["Sorted"]
-        new_sheet.range("A" + str(comic_num) + ":P" + str(comic_num)).value = data
-        new_sheet.range("A" + str(comic_num) + ":P" + str(comic_num)).api.Font.Bold = True
-        driver.get("https://comicspriceguide.com/Search")
+        # new_sheet = workbook.sheets["Sorted"]
+        #new_sheet.range("A" + str(comic_num) + ":P" + str(comic_num)).value = data
         continue
 
-Print("Work is complete.")
+writer = ExcelWriter(ExcelWorkbookName)    
+dfResults.to_excel(writer,'Results')
+print("Work is complete.")
