@@ -1,7 +1,6 @@
 from selenium import webdriver
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.by import  By
-#import xlwings as xw
 from pprint import pprint
 import bs4
 import time
@@ -17,23 +16,18 @@ def similar(a, b):
 
 driver = webdriver.Chrome()
 driver.maximize_window()
-#workbook = xw.Book("Comics.xlsx")
-#sheet = workbook.sheets['My Collection']
 
 ExcelWorkbookName = 'Comics.xlsx'
 
-sheet = pd.read_excel(open(ExcelWorkbookName, 'rb'),
-              sheet_name='My Collection')
+sheet = pd.read_excel(open(ExcelWorkbookName, 'rb'), sheet_name='My Collection')
 
-# Create an empty Dataframe
+# Create an empty Dataframe for our results
 dfResults = pd.DataFrame(columns = ['title','issue','grade','cgc','publisher',
                                     'volume','published','keyIssue','price_paid',
                                     'cover_price','price','comic_age','notes',
                                     'characters_info','story','url_link'])
 
-
 driver.get("https://comicspriceguide.com/login")
-
 
 # Login Elements
 input_login_username = driver.find_element_by_xpath('//input[@id="user_username"]')
@@ -47,12 +41,6 @@ driver.execute_script("arguments[0].click();",button_login_submit)
 
 # Waiting time for page to load.
 time.sleep(10)
-
-# If the sheet doesnt exist, then create it. If it exists, then don't.
-#date = date.today().strftime("%Y-%m-%d")
-#sheets_list = [sh.name for sh in workbook.sheets]
-#if date not in sheets_list :
- #   xw.sheets.add(date)
 
 for comic_num in sheet.iterrows():
     try:
@@ -163,7 +151,10 @@ for comic_num in sheet.iterrows():
         url_link = driver.current_url
 
         # Uncomment below to debug
-        #print(publisher,title,volume,issue,grade,cgc,notes,price_paid,published,comic_age,cover_price,price,characters_info,story)
+# =============================================================================
+#         print(publisher,title,volume,issue,grade,cgc,notes,price_paid,
+#               published,comic_age,cover_price,price,characters_info,story)
+# =============================================================================
 
         # Data to be put into excel file
         dfResults = dfResults.append({'title' : title,
@@ -174,18 +165,18 @@ for comic_num in sheet.iterrows():
                                       'volume':volume,
                                       'published':published,
                                       'keyIssue':keyIssue,
-                                     'price_paid':price_paid,
-                                     'cover_price':cover_price,
-                                     'price':price,
-                                     'comic_age':comic_age,
-                                     'notes':notes,
-                                     'characters_info':characters_info,
-                                     'story':story,
-                                     'url_link':url_link}, ignore_index=True)
+                                      'price_paid':price_paid,
+                                      'cover_price':cover_price,
+                                      'price':price,
+                                      'comic_age':comic_age,
+                                      'notes':notes,
+                                      'characters_info':characters_info,
+                                      'story':story,
+                                      'url_link':url_link}, ignore_index=True)
 
         
     except Exception as e:
-        print("Oops there was an error." + str(e))
+        print("Error: " + str(e))
         dfResults = dfResults.append({'title' : comic_num[1][1],
                                       'issue' : comic_num[1][3],
                                       'grade': comic_num[1][4],
@@ -193,6 +184,7 @@ for comic_num in sheet.iterrows():
         driver.get("https://comicspriceguide.com/Search")
         continue
 
-writer = ExcelWriter(ExcelWorkbookName)    
-dfResults.to_excel(writer,date.today().strftime("%Y-%m-%d"))
+sheetname = date.today().strftime("%Y-%m-%d")
+with pd.ExcelWriter(ExcelWorkbookName, mode='a') as writer:  
+    dfResults.to_excel(writer, sheet_name=sheetname)
 print("Work is complete.")
