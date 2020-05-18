@@ -24,7 +24,7 @@ sheet = pd.read_excel(open(ExcelWorkbookName, 'rb'), sheet_name='My Collection')
 # Create an empty Dataframe for our results
 dfResults = pd.DataFrame(columns = ['title','issue','grade','cgc','publisher',
                                     'volume','published','keyIssue','price_paid',
-                                    'cover_price','price','comic_age','notes',
+                                    'cover_price','value','comic_age','notes',
                                     'characters_info','story','url_link'])
 
 driver.get("https://comicspriceguide.com/login")
@@ -144,7 +144,7 @@ for comic_num in sheet.iterrows():
                 id = 'lblValue' + str(grade).replace('.','')
 
             if(td.find('span',attrs={'id':id}) != None):
-                price =  td.find('span',attrs={'id':id}).text
+                value =  td.find('span',attrs={'id':id}).text
 
         characters_info = soup.find('div',attrs={'id':'dvCharacterList'}).text if soup.find('div',attrs={'id':'dvCharacterList'}) != None else "No Info Found"
         story = soup.find('div',attrs={'id':'dvStoryList'}).text.replace("Stories may contain spoilers","")
@@ -153,7 +153,7 @@ for comic_num in sheet.iterrows():
         # Uncomment below to debug
 # =============================================================================
 #         print(publisher,title,volume,issue,grade,cgc,notes,price_paid,
-#               published,comic_age,cover_price,price,characters_info,story)
+#               published,comic_age,cover_price,value,characters_info,story)
 # =============================================================================
 
         # Data to be put into excel file
@@ -167,7 +167,7 @@ for comic_num in sheet.iterrows():
                                       'keyIssue':keyIssue,
                                       'price_paid':price_paid,
                                       'cover_price':cover_price,
-                                      'price':price,
+                                      'value':value,
                                       'comic_age':comic_age,
                                       'notes':notes,
                                       'characters_info':characters_info,
