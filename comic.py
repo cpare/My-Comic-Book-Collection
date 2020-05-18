@@ -29,6 +29,10 @@ dfResults = pd.DataFrame(columns = ['title','issue','grade','cgc','publisher',
 
 driver.get("https://comicspriceguide.com/login")
 
+# The error codes
+
+NO_SEARCH_RESULTS_FOUND = 1
+
 # Login Elements
 input_login_username = driver.find_element_by_xpath('//input[@id="user_username"]')
 input_login_password = driver.find_element_by_xpath('//input[@id="user_password"]')
@@ -109,6 +113,9 @@ for comic_num in sheet.iterrows():
         # Goto the comic page if result is found.
         if comic_link != '':
             driver.get(comic_link)
+        else:
+            raise ValueError(NO_SEARCH_RESULTS_FOUND,"Looks like the search gave no result. Try searching the title and issue manually to confirm the issue.",comic[1],comic[3])
+
 
         # Wait 5 seconds for page to load and get its source code
         time.sleep(5)
@@ -174,6 +181,14 @@ for comic_num in sheet.iterrows():
                                       'story':story,
                                       'url_link':url_link}, ignore_index=True)
 
+    except ValueError as ve:
+        if(ve.args[0] == NO_SEARCH_RESULTS_FOUND):
+            print("ERROR!!!\n",ve.args[1],"\nTitle :",ve.args[2],"\nIssue :",ve.args[3])
+            dfResults = dfResults.append({'title' : comic_num[1][1],
+                                          'issue' : comic_num[1][3],
+                                          'grade' : comic_num[1][4],
+                                          'cgc'   : comic_num[1][5]}, ignore_index=True)
+        driver.get("https://comicspriceguide.com/Search")
         
     except Exception as e:
         print("Error: " + str(e))
