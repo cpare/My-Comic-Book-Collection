@@ -1,6 +1,6 @@
 # My-Comic-Book-Collection
   Python script that takes just a few inputs from an Google sheet to query for additional details from https://comicspriceguide.com.  
-Result is an updated HTML page and XLS with current values, description, and other helpful features
+Result is an updated sheet with current values, description, and other helpful features as well as a helpful HTML page with your entire collection in s nice visual layout.
 
 <b>Provide the following items in an XLS:</b>
  - <b>Title</b> - Your Comics Title (Amazing Spider Man)
