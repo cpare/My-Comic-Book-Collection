@@ -1,5 +1,5 @@
 # My-Comic-Book-Collection
-  Python script that takes just a few inputs from an Excel sheet to query for additional details from https://comicspriceguide.com.  
+  Python script that takes just a few inputs from an Google sheet to query for additional details from https://comicspriceguide.com.  
 Result is an updated HTML page and XLS with current values, description, and other helpful features
 
 <b>Provide the following items in an XLS:</b>
