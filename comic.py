@@ -29,6 +29,121 @@ Google_Sheet = input('Google Worksheet Name:    ')
 def similar(a, b):
     return SequenceMatcher(None, a, b).ratio()
 
+
+# All valid CGC grades in ascending order
+GRADE_SCALE = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5,
+               5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0,
+               9.2, 9.4, 9.6, 9.8, 10.0]
+
+
+def _format_grade(g):
+    """Format a float grade as eBay searchers would type it (e.g. 9.8, 1.0)."""
+    return f"{g:.1f}" if g != int(g) or g >= 9.2 else f"{g:.1f}"
+
+
+def _ebay_sold_prices(query):
+    """
+    Search eBay sold/completed listings for *query* and return a list of
+    sale prices (floats) sorted newest-first.
+    """
+    search_url = (
+        "https://www.ebay.com/sch/i.html?"
+        f"_nkw={query.replace(' ', '+')}"
+        "&LH_Sold=1&LH_Complete=1&_sop=13"   # sort: Time: ending soonest (newest first)
+    )
+    driver.get(search_url)
+    time.sleep(random.uniform(3, 7))
+    soup = bs4.BeautifulSoup(driver.page_source, 'html.parser')
+
+    prices = []
+    for span in soup.find_all('span', attrs={'class': 's-item__price'}):
+        raw = span.text.strip().replace('$', '').replace(',', '')
+        try:
+            if ' to ' in raw:
+                parts = raw.split(' to ')
+                prices.append((float(parts[0]) + float(parts[1])) / 2)
+            else:
+                prices.append(float(raw))
+        except ValueError:
+            pass
+    return prices
+
+
+def _ebay_price_for_grade(title, issue, grade_float, cgc, variant=''):
+    """Return the most-recent eBay sold price for a specific grade, or None."""
+    cgc_str = "CGC" if cgc.upper() != 'NO' else ""
+    grade_str = _format_grade(grade_float)
+    query = f"{title} #{issue} {cgc_str} {grade_str} {variant}".strip()
+    prices = _ebay_sold_prices(query)
+    if prices:
+        print(f"     eBay [{grade_str}]: ${prices[0]:.2f}  ({len(prices)} sales found)")
+        return prices[0]
+    return None
+
+
+def GetEbayPrice(title, issue, grade, cgc, variant=''):
+    """
+    Look up the most recent eBay sold price for the given comic + grade.
+
+    Strategy:
+      1. Try exact grade match.
+      2. If no sales, walk outward on GRADE_SCALE to find the nearest lower
+         and higher grades that have sales, then linearly interpolate.
+      3. Return None if no eBay data at all.
+    """
+    try:
+        target = float(grade)
+    except ValueError:
+        print(f"     eBay: Cannot parse grade '{grade}'")
+        return None
+
+    # 1. Exact match
+    price = _ebay_price_for_grade(title, issue, target, cgc, variant)
+    if price is not None:
+        return price
+
+    # 2. Interpolate
+    print(f"     eBay: No sales for grade {grade} – searching nearby grades…")
+
+    if target not in GRADE_SCALE:
+        print(f"     eBay: Grade {target} not in standard scale – cannot interpolate.")
+        return None
+
+    idx = GRADE_SCALE.index(target)
+
+    lower_grade, lower_price = None, None
+    for g in reversed(GRADE_SCALE[:idx]):
+        p = _ebay_price_for_grade(title, issue, g, cgc, variant)
+        if p is not None:
+            lower_grade, lower_price = g, p
+            break
+
+    upper_grade, upper_price = None, None
+    for g in GRADE_SCALE[idx + 1:]:
+        p = _ebay_price_for_grade(title, issue, g, cgc, variant)
+        if p is not None:
+            upper_grade, upper_price = g, p
+            break
+
+    if lower_price is not None and upper_price is not None:
+        ratio = (target - lower_grade) / (upper_grade - lower_grade)
+        interpolated = round(lower_price + ratio * (upper_price - lower_price), 2)
+        print(
+            f"     eBay: Interpolated {grade} from "
+            f"{lower_grade}=${lower_price:.2f} ↔ {upper_grade}=${upper_price:.2f} "
+            f"→ ${interpolated:.2f}"
+        )
+        return interpolated
+    elif lower_price is not None:
+        print(f"     eBay: Using nearest lower grade {lower_grade} → ${lower_price:.2f}")
+        return lower_price
+    elif upper_price is not None:
+        print(f"     eBay: Using nearest upper grade {upper_grade} → ${upper_price:.2f}")
+        return upper_price
+
+    print(f"     eBay: No usable sales data found for {title} #{issue}.")
+    return None
+
 driver = webdriver.Chrome()
 
 #driver.maximize_window()
@@ -298,7 +413,17 @@ for index, thisComic in sortedsheet.iterrows():
         thisbooksgrade = pricesdf.loc[pricesdf['Condition'] == grade]
         RawValue = float(thisbooksgrade['Raw Value'].iloc[0].replace('$',''))
         GradedValue = float(thisbooksgrade['Graded Value'].iloc[0].replace('$',''))
-        value = RawValue if cgc.upper() == 'NO' else GradedValue   
+        cpg_value = RawValue if cgc.upper() == 'NO' else GradedValue
+
+        # --- eBay pricing (issue #5) ---
+        # Prefer real market data (last eBay sale) over guide prices.
+        ebay_value = GetEbayPrice(title, issue, grade, cgc, variant)
+        if ebay_value is not None:
+            value = ebay_value
+            print(f"     Using eBay price: ${value:.2f} (CPG guide: ${cpg_value:.2f})")
+        else:
+            value = cpg_value
+            print(f"     eBay price unavailable – falling back to CPG guide: ${value:.2f}")
         characters_info = soup.find('div',attrs={'id':'dvCharacterList'}).text if soup.find('div',attrs={'id':'dvCharacterList'}) != None else "No Info Found"
         story = soup.find('div',attrs={'id':'dvStoryList'}).text.replace("Stories may contain spoilers","")
         url_link = driver.current_url
