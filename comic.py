@@ -1,12 +1,10 @@
 from __future__ import print_function
-from selenium import webdriver
-from selenium.webdriver.common.by import By   # Fix: deprecated find_element_by_* removed in Selenium 4
+import requests
 import bs4
 import time
 from difflib import SequenceMatcher
 from datetime import date
 import pandas as pd
-import sys
 import random
 import gspread
 import locale
@@ -19,13 +17,28 @@ locale.setlocale(locale.LC_ALL, '')
 # =============================================================================
 rundate = date.today().strftime("%Y-%m-%d")
 htmlBody = ''
-# The error codes
 NO_SEARCH_RESULTS_FOUND = 1
 
 User_Name = input('ComicsPriceGuide.com Username:  ')
 User_Pass = input('ComicsPriceGuide.com Password:  ')
 Google_Workbook = input('Google Workbook Name:    ')
 Google_Sheet = input('Google Worksheet Name:    ')
+
+# =============================================================================
+#   Requests session — replaces Selenium/Chrome entirely
+# =============================================================================
+session = requests.Session()
+session.headers.update({
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/120.0.0.0 Safari/537.36'
+    ),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+})
 
 
 def similar(a, b):
@@ -43,6 +56,22 @@ def _format_grade(g):
     return f"{g:.1f}"
 
 
+def _get_page(url, retries=3, delay_range=(2, 6)):
+    """GET a URL with retry logic. Returns BeautifulSoup and final URL."""
+    for attempt in range(retries):
+        try:
+            time.sleep(random.uniform(*delay_range))
+            resp = session.get(url, timeout=30, allow_redirects=True)
+            resp.raise_for_status()
+            soup = bs4.BeautifulSoup(resp.text, 'html.parser')
+            return soup, resp.url
+        except requests.RequestException as e:
+            print(f"     Request error (attempt {attempt + 1}/{retries}): {e}")
+            if attempt == retries - 1:
+                raise
+    return None, url
+
+
 def _ebay_sold_prices(query):
     """
     Search eBay sold/completed listings for *query* and return a list of
@@ -50,12 +79,13 @@ def _ebay_sold_prices(query):
     """
     search_url = (
         "https://www.ebay.com/sch/i.html?"
-        f"_nkw={quote_plus(query)}"   # Fix: use proper URL encoding for special chars
+        f"_nkw={quote_plus(query)}"
         "&LH_Sold=1&LH_Complete=1&_sop=13"
     )
-    driver.get(search_url)
-    time.sleep(random.uniform(3, 7))
-    soup = bs4.BeautifulSoup(driver.page_source, 'html.parser')
+    try:
+        soup, _ = _get_page(search_url, delay_range=(1, 3))
+    except requests.RequestException:
+        return []
 
     prices = []
     for span in soup.find_all('span', attrs={'class': 's-item__price'}):
@@ -147,48 +177,81 @@ def GetEbayPrice(title, issue, grade, cgc, variant=''):
     return None
 
 
-driver = webdriver.Chrome()
-
-
 def LoginComicsPriceGuide(User_Name, User_Pass):
-    driver.get("https://comicspriceguide.com/login")
-    # Fix: find_element_by_xpath / find_element_by_id removed in Selenium 4
-    input_login_username = driver.find_element(By.ID, "user_username")
-    input_login_password = driver.find_element(By.ID, "user_password")
-    button_login_submit = driver.find_element(By.ID, "btnLogin")
-    input_login_username.send_keys(User_Name)
-    input_login_password.send_keys(User_Pass)
-    driver.execute_script("arguments[0].click();", button_login_submit)
-    time.sleep(random.uniform(5, 20))
+    """
+    Log into ComicsPriceGuide.com using a requests session.
+    Discovers the login form dynamically to handle CSRF tokens or hidden fields.
+    """
+    print("Logging into ComicsPriceGuide.com...")
+    resp = session.get("https://comicspriceguide.com/login", timeout=30)
+    soup = bs4.BeautifulSoup(resp.text, 'html.parser')
+
+    # Build payload from all hidden form fields (captures CSRF tokens etc.)
+    form = soup.find('form')
+    payload = {}
+    action = 'https://comicspriceguide.com/login'
+    if form:
+        for hidden in form.find_all('input', {'type': 'hidden'}):
+            if hidden.get('name'):
+                payload[hidden['name']] = hidden.get('value', '')
+        raw_action = form.get('action', '/login')
+        action = raw_action if raw_action.startswith('http') else f"https://comicspriceguide.com{raw_action}"
+
+    payload['user_username'] = User_Name
+    payload['user_password'] = User_Pass
+
+    time.sleep(random.uniform(1, 3))
+    resp = session.post(action, data=payload, timeout=30, allow_redirects=True)
+
+    # Verify login succeeded by checking for logout link or user-specific content
+    if 'logout' in resp.text.lower() or 'sign out' in resp.text.lower():
+        print("Login successful.")
+    else:
+        print(f"WARNING: Login may have failed (HTTP {resp.status_code}). Continuing anyway.")
+
+    time.sleep(random.uniform(1, 3))
 
 
 def SearchComic(Title, Issue, fullName, thisComic):
-    # Fix: fullName and thisComic are now explicit parameters instead of globals
+    """
+    Search ComicsPriceGuide for a comic by title and issue.
+    Returns [best_match_url, confidence_percentage].
+    """
     print(fullName + " - Searching...")
-    if driver.current_url != "https://comicspriceguide.com/Search":
-        driver.get("https://comicspriceguide.com/Search")
-    driver.implicitly_wait(15)
-    # Fix: use By.ID instead of deprecated find_element_by_id
-    input_search_title = driver.find_element(By.ID, "search")
-    input_search_issue = driver.find_element(By.ID, "issueNu")
-    button_search_submit = driver.find_element(By.ID, "btnSearch")
-    input_search_title.send_keys(Title)
-    input_search_issue.send_keys(Issue)
-    time.sleep(random.uniform(2, 15))
-    driver.execute_script("arguments[0].click();", button_search_submit)
-    time.sleep(random.uniform(5, 30))
-    source_code = driver.page_source
-    soup = bs4.BeautifulSoup(source_code, 'html.parser')
+
+    # GET the search page to discover the form structure
+    resp = session.get("https://comicspriceguide.com/Search", timeout=30)
+    soup = bs4.BeautifulSoup(resp.text, 'html.parser')
+
+    form = soup.find('form')
+    payload = {}
+    action = 'https://comicspriceguide.com/Search'
+    if form:
+        for hidden in form.find_all('input', {'type': 'hidden'}):
+            if hidden.get('name'):
+                payload[hidden['name']] = hidden.get('value', '')
+        raw_action = form.get('action', '/Search')
+        action = raw_action if raw_action.startswith('http') else f"https://comicspriceguide.com{raw_action}"
+
+    payload['search'] = Title
+    payload['issueNu'] = str(Issue)
+
+    time.sleep(random.uniform(2, 8))
+    resp = session.post(action, data=payload, timeout=30, allow_redirects=True)
+    soup = bs4.BeautifulSoup(resp.text, 'html.parser')
+
     similarity = 0
     comic_link = ''
     percentage = 0
+
     for candidate in soup.find_all('a', attrs={'class': 'grid_issue'}):
         a = str(candidate.text).replace("<sup>#</sup>", "#").upper()
-        percentage = similar(a, fullName)
-        if percentage > similarity:
-            similarity = similar(a, fullName)
-            final_link = 'https://comicspriceguide.com' + str(candidate["href"])
-            comic_link = final_link
+        pct = similar(a, fullName)
+        if pct > similarity:
+            similarity = pct
+            percentage = pct
+            comic_link = 'https://comicspriceguide.com' + str(candidate["href"])
+
     if percentage > 0:
         print("     Found a match, confidence: " + str(int(percentage * 100)) + "% - " + comic_link)
     else:
@@ -200,28 +263,25 @@ def SearchComic(Title, Issue, fullName, thisComic):
 
 
 def generate_HTMLPage(sortedsheet):
-    global htmlBody   # Fix: UnboundLocalError — must declare global before assignment
-    htmlBody = ''     # Reset so re-runs don't append to stale content
+    global htmlBody
+    htmlBody = ''  # Reset so re-runs don't append to stale content
 
     for index, thisComic in sortedsheet.iterrows():
         title = str(thisComic['Title']).strip().upper()
         notes = str(thisComic['Notes']).strip()
         issue = int(str(thisComic['Issue']).strip())
-        # Fix: value is float, not int — int() truncates cents (e.g. $19.99 → $19)
         try:
             value = float(str(thisComic['Value']).strip().replace('$', '').replace(',', ''))
         except (ValueError, KeyError):
             value = 0.0
-        image = str(thisComic['Cover Image']).strip()  # Fix: removed .upper() — uppercasing breaks URLs
+        image = str(thisComic['Cover Image']).strip()
         grade = str(thisComic['Grade']).strip()
         cgc = "No" if thisComic['CGC Graded'] is None else thisComic['CGC Graded']
-        # Fix: Key was incorrectly reading CGC Graded field instead of KeyIssue
         key = "No" if thisComic['KeyIssue'] is None else thisComic['KeyIssue']
         variant = '' if str(thisComic['Variant']).strip() == 'nan' else str(thisComic['Variant']).strip()
         url = '' if str(thisComic['Book Link']).strip() == 'nan' else str(thisComic['Book Link']).strip()
 
         cgcdiv = '' if cgc.upper() == 'NO' else "<div class='cgc'>CGC</div>"
-        # Fix: was checking 'key' (lowercase) but variable was 'Key' (uppercase) — NameError
         keydiv = '' if key.upper() == 'NO' else "<div class='key'>KEY</div>"
 
         htmlBody += (
@@ -266,10 +326,10 @@ def generate_HTMLPage(sortedsheet):
 
 
 def ReadGoogleSheet(Google_Workbook, Google_Sheet):
-    # =============================================================================
-    #   Read Google sheet into pandas Dataframe - Requires Service Account in Google API
-    #   file stored in ~/.config/gspread/service_account.json
-    # =============================================================================
+    """
+    Read Google Sheet into a pandas DataFrame.
+    Requires service account at ~/.config/gspread/service_account.json
+    """
     gc = gspread.service_account()
     sh = gc.open(Google_Workbook)
     worksheet = sh.worksheet(Google_Sheet)
@@ -279,8 +339,7 @@ def ReadGoogleSheet(Google_Workbook, Google_Sheet):
 
 
 def BackupGoogleSheet(sh, Starting_DF, sortedsheet):
-    # Fix: was using globals sh/Starting_DF/sortedsheet; now passed as explicit parameters
-    # Fix: Sheetname parameter was unused; removed it
+    """Create a dated backup worksheet in the same Google Workbook."""
     starting_rows = Starting_DF.shape[0]
     starting_cols = Starting_DF.shape[1]
     backup = sh.add_worksheet(title="Backup " + rundate, rows=starting_rows, cols=starting_cols)
@@ -313,9 +372,6 @@ for index, thisComic in sortedsheet.iterrows():
         variant = '' if str(thisComic['Variant']).strip() == 'nan' else str(thisComic['Variant']).strip()
         url = '' if str(thisComic['Book Link']).strip() == 'nan' else str(thisComic['Book Link']).strip()
 
-        # Fix: simplified and corrected price_paid conversion logic
-        # Previous code had a dead-code else branch (float() is never None) and
-        # could double-parse the string causing an error on malformed input.
         price_paid = 0.0
         raw_paid = thisComic['Price Paid']
         try:
@@ -327,7 +383,7 @@ for index, thisComic in sortedsheet.iterrows():
             print(f'WARNING: Could not parse Price Paid value: {raw_paid!r}')
 
         if price_paid == 0:
-            price_paid = 0.01   # Avoid divide-by-zero in any ROI calculations
+            price_paid = 0.01  # Avoid divide-by-zero in ROI calculations
 
         sortedsheet.at[index, 'Price Paid'] = price_paid
         fullName = title + " #" + str(issue) + variant
@@ -336,7 +392,6 @@ for index, thisComic in sortedsheet.iterrows():
 
         if url == '':
             print('No direct URL - Calling search')
-            # Fix: pass fullName and thisComic explicitly (no longer implicit globals)
             search_results_Array = SearchComic(title, issue, fullName, thisComic)
             url = search_results_Array[0]
             confidence = search_results_Array[1]
@@ -344,16 +399,13 @@ for index, thisComic in sortedsheet.iterrows():
         # =============================================================================
         #  A match has been determined - get the details
         # =============================================================================
-        if url != '':
-            driver.get(url)
-        else:
+        if url == '':
             raise ValueError(NO_SEARCH_RESULTS_FOUND,
                              "Looks like the search gave no result.",
                              thisComic['Title'], thisComic['Issue'])
 
-        time.sleep(random.uniform(60, 240))
-        source_code = driver.page_source
-        soup = bs4.BeautifulSoup(source_code, 'html.parser')
+        time.sleep(random.uniform(5, 15))
+        soup, final_url = _get_page(url)
 
         publisher = soup.find('a', attrs={'id': 'hypPub'}).text
         volume = soup.find('span', attrs={'id': 'lblVolume'}).text
@@ -372,8 +424,6 @@ for index, thisComic in sortedsheet.iterrows():
 
         # =============================================================================
         #  Get prices from CPG price table
-        #  Fix: pad grade to 3 chars BEFORE eBay lookup so both sources use same format
-        #  Known Defect: grade 10.0 stored as '10.' on CPG — truncation to [:3] gives '10.'
         # =============================================================================
         if len(grade) < 3:
             grade = grade + ".0"
@@ -387,8 +437,7 @@ for index, thisComic in sortedsheet.iterrows():
         GradedValue = float(thisbooksgrade['Graded Value'].iloc[0].replace('$', ''))
         cpg_value = RawValue if cgc.upper() == 'NO' else GradedValue
 
-        # --- eBay pricing (issue #5) ---
-        # Prefer real market data (last eBay sale) over guide prices.
+        # --- eBay pricing ---
         ebay_value = GetEbayPrice(title, issue, grade, cgc, variant)
         if ebay_value is not None:
             value = ebay_value
@@ -403,10 +452,9 @@ for index, thisComic in sortedsheet.iterrows():
             else "No Info Found"
         )
         story = soup.find('div', attrs={'id': 'dvStoryList'}).text.replace("Stories may contain spoilers", "")
-        url_link = driver.current_url
 
         # =============================================================================
-        #  update the DataFrame
+        #  Update the DataFrame
         # =============================================================================
         sortedsheet.at[index, 'Publisher'] = publisher
         sortedsheet.at[index, 'Volume'] = volume
@@ -416,7 +464,7 @@ for index, thisComic in sortedsheet.iterrows():
         sortedsheet.at[index, 'Comic Age'] = comic_age
         sortedsheet.at[index, 'Notes'] = notes
         sortedsheet.at[index, 'Confidence'] = confidence if confidence != '' else None
-        sortedsheet.at[index, 'Book Link'] = url_link
+        sortedsheet.at[index, 'Book Link'] = final_url
         sortedsheet.at[index, 'Graded'] = GradedValue
         sortedsheet.at[index, 'Ungraded'] = RawValue
         sortedsheet.at[index, 'Cover Image'] = image
@@ -431,9 +479,7 @@ for index, thisComic in sortedsheet.iterrows():
         continue
 
 # =============================================================================
-#  Commit results back to Google Sheet
-#  Fix: worksheet.update() was inside the for loop — moved outside so we make
-#       one API call at the end instead of one per comic (major performance fix)
+#  Commit results back to Google Sheet (one API call at the end)
 # =============================================================================
 sortedsheet.fillna('', inplace=True)
 worksheet.update([sortedsheet.columns.values.tolist()] + sortedsheet.values.tolist())
