@@ -28,6 +28,7 @@ from core import (
     safe_fillna,
     normalise_grade,
     rundate,
+    ID_DATE_COL,
 )
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
@@ -115,6 +116,8 @@ def ReadGoogleSheet(workbook, sheet):
     sh = gc.open(workbook)
     worksheet = sh.worksheet(sheet)
     df = pd.DataFrame(worksheet.get_all_records())
+    if ID_DATE_COL not in df.columns:
+        df[ID_DATE_COL] = ''
     sorted_df = df.sort_values(by=['Title', 'Volume', 'Issue'])
     return df, sorted_df, worksheet, sh
 
@@ -177,13 +180,21 @@ for index, thisComic in sortedsheet.iterrows():
         print(f'Gathering : {fullName}')
 
         # =====================================================================
-        #  Comic Vine metadata
+        #  Task 1: Book Identification (Comic Vine)
+        #  Only runs if Identification Date is blank
         # =====================================================================
-        cv_data = SearchComicVine(
+        id_date = str(thisComic.get(ID_DATE_COL, '')).strip()
+        id_date = '' if id_date in ('nan', 'None') else id_date
+
+        if id_date:
+            print(f"     CV: Already identified on {id_date} — skipping")
+            cv_data = None
+        else:
+            cv_data = SearchComicVine(
             session, CV_API_KEY, title, issue, variant,
             volume_number=volume_number,
-            publisher=existing_publisher,
-        )
+                publisher=existing_publisher,
+            )
 
         if cv_data:
             cv_publisher = cv_data['publisher']
@@ -233,7 +244,7 @@ for index, thisComic in sortedsheet.iterrows():
 
         if cv_data:
             sortedsheet.at[index, 'Publisher']   = cv_publisher
-            sortedsheet.at[index, 'Volume']      = cv_volume
+            # Volume is user-owned (volume number e.g. "Volume 1") — never overwrite
             sortedsheet.at[index, 'Published']   = published
             sortedsheet.at[index, 'KeyIssue']    = key_issue
             sortedsheet.at[index, 'Cover Price'] = cover_price
@@ -241,6 +252,7 @@ for index, thisComic in sortedsheet.iterrows():
             sortedsheet.at[index, 'Notes']       = notes
             sortedsheet.at[index, 'Confidence']  = round(confidence, 4)
             sortedsheet.at[index, 'Cover Image'] = cover_image
+            sortedsheet.at[index, ID_DATE_COL]   = rundate
             if not existing_book_link:
                 sortedsheet.at[index, 'Book Link'] = cv_book_link
 

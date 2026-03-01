@@ -1,13 +1,17 @@
 """
-test_run.py — Integration test against live Google Sheet + APIs.
-Processes first N records, writes results back, reports success rate.
+test_run.py — Integration test. Processes first N records.
+
+Two independent tasks:
+  1. Book Identification (Comic Vine) — runs only if 'Identification Date' is blank.
+     On success, writes enrichment fields + sets Identification Date = today.
+  2. Book Valuation (eBay) — always runs regardless of identification status.
 
 Input fields (user-owned, never overwritten):
   Title, Issue, Grade, CGC Graded, Variant, Price Paid, Book Link (if pre-populated)
 
-Output/enrichment fields (written by this script):
+Output/enrichment fields:
   Publisher, Volume, Published, KeyIssue, Cover Price, Comic Age, Notes,
-  Confidence, Book Link (only if blank), Cover Image,
+  Confidence, Identification Date, Book Link (only if blank), Cover Image,
   Graded, Ungraded, Graded Gain, Value, <rundate>
 """
 from __future__ import print_function
@@ -28,12 +32,13 @@ from core import (
     safe_fillna,
     normalise_grade,
     rundate,
+    ID_DATE_COL,
 )
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 locale.setlocale(locale.LC_ALL, '')
 
-TEST_LIMIT      = 20
+TEST_LIMIT      = 100
 Google_Workbook = os.getenv('GOOGLE_WORKBOOK') or input('Google Workbook Name: ')
 Google_Sheet    = os.getenv('GOOGLE_SHEET')    or input('Google Sheet Name: ')
 CV_API_KEY      = os.getenv('CV_API_KEY')      or input('Comic Vine API Key: ')
@@ -53,13 +58,25 @@ worksheet = sh.worksheet(Google_Sheet)
 StartingDF   = pd.DataFrame(worksheet.get_all_records())
 sortedsheet  = StartingDF.sort_values(by=['Title', 'Volume', 'Issue']).copy()
 
+# Add Identification Date column if it doesn't exist
+if ID_DATE_COL not in sortedsheet.columns:
+    print(f"Adding '{ID_DATE_COL}' column to sheet...")
+    sortedsheet[ID_DATE_COL] = ''
+
 print(f"Loaded {len(sortedsheet)} total records. Processing first {TEST_LIMIT}...\n")
 test_sheet = sortedsheet.head(TEST_LIMIT).copy()
 
 # =============================================================================
 #  Metrics
 # =============================================================================
-stats = {'cv_hit': 0, 'cv_miss': 0, 'ebay_hit': 0, 'ebay_miss': 0, 'errors': 0}
+stats = {
+    'cv_hit':      0,   # CV returned a confident match
+    'cv_miss':     0,   # CV returned nothing / below threshold
+    'cv_skipped':  0,   # Already identified — skipped
+    'ebay_hit':    0,
+    'ebay_miss':   0,
+    'errors':      0,
+}
 
 # =============================================================================
 #  Main loop
@@ -68,7 +85,7 @@ for index, thisComic in test_sheet.iterrows():
     n = list(test_sheet.index).index(index) + 1
     try:
         # =====================================================================
-        #  READ-ONLY inputs — user's source of truth, never overwritten
+        #  READ-ONLY inputs
         # =====================================================================
         title   = str(thisComic['Title']).strip().upper()
         issue   = int(str(thisComic['Issue']).strip())
@@ -77,11 +94,9 @@ for index, thisComic in test_sheet.iterrows():
         variant = str(thisComic.get('Variant', '')).strip()
         variant = '' if variant in ('nan', 'None') else variant
 
-        # Book Link: if user pre-populated, use it and don't overwrite
         existing_book_link = str(thisComic.get('Book Link', '')).strip()
         existing_book_link = '' if existing_book_link in ('nan', 'None') else existing_book_link
 
-        # Price Paid
         price_paid = 0.0
         try:
             raw_paid = thisComic.get('Price Paid', 0)
@@ -90,16 +105,16 @@ for index, thisComic in test_sheet.iterrows():
             elif isinstance(raw_paid, (int, float)):
                 price_paid = float(raw_paid)
         except (ValueError, TypeError):
-            print(f'     WARNING: Could not parse Price Paid: {thisComic.get("Price Paid")!r}')
+            pass
         if price_paid == 0:
             price_paid = 0.01
 
-        # =====================================================================
-        #  Enrichment inputs — read for matching context, will be written back
-        # =====================================================================
-        existing_publisher = str(thisComic.get('Publisher', '')).strip()
+        # Identification Date — controls whether CV runs
+        id_date = str(thisComic.get(ID_DATE_COL, '')).strip()
+        id_date = '' if id_date in ('nan', 'None') else id_date
 
-        # Volume column format: "Volume 1", "Vol. 2", or just "1"
+        # Enrichment context for matching
+        existing_publisher = str(thisComic.get('Publisher', '')).strip()
         raw_volume = str(thisComic.get('Volume', '')).strip()
         vol_match = re.search(r'\d+', raw_volume)
         volume_number = int(vol_match.group()) if vol_match else None
@@ -108,38 +123,28 @@ for index, thisComic in test_sheet.iterrows():
         print(f"\n[{n}/{TEST_LIMIT}] {fullName}")
 
         # =====================================================================
-        #  Comic Vine metadata lookup
+        #  Task 1: Book Identification (Comic Vine)
+        #  Only runs if Identification Date is blank
         # =====================================================================
-        cv_data = SearchComicVine(
-            session, CV_API_KEY, title, issue, variant,
-            volume_number=volume_number,
-            publisher=existing_publisher,
-        )
-
-        if cv_data:
-            stats['cv_hit'] += 1
-            cv_publisher = cv_data['publisher']
-            cv_volume    = cv_data['volume']
-            published    = cv_data['published']
-            cover_price  = cv_data['cover_price']
-            comic_age    = cv_data['comic_age']
-            notes        = cv_data['notes']
-            key_issue    = cv_data['key_issue']
-            cover_image  = cv_data['cover_image']
-            cv_book_link = cv_data['book_link']
-            confidence   = cv_data['confidence']
+        if id_date:
+            stats['cv_skipped'] += 1
+            print(f"     CV: Already identified on {id_date} — skipping")
+            cv_data = None
         else:
-            stats['cv_miss'] += 1
-            cv_publisher = cv_volume = published = cover_price = comic_age = ''
-            notes = key_issue = cover_image = cv_book_link = ''
-            confidence = None
-            print("     CV: no confident match — enrichment fields unchanged")
+            cv_data = SearchComicVine(
+                session, CV_API_KEY, title, issue, variant,
+                volume_number=volume_number,
+                publisher=existing_publisher,
+            )
+            if cv_data:
+                stats['cv_hit'] += 1
+            else:
+                stats['cv_miss'] += 1
 
         # =====================================================================
-        #  eBay pricing: graded, ungraded, and current-state value
+        #  Task 2: Book Valuation (eBay) — always runs
         # =====================================================================
         grade_norm = normalise_grade(grade)
-
         graded_price   = GetEbayPriceGraded(session, title, issue, grade_norm or grade, variant)
         ungraded_price = GetEbayPriceUngraded(session, title, issue, grade_norm or grade, variant)
 
@@ -161,41 +166,44 @@ for index, thisComic in test_sheet.iterrows():
                 ) or 0.0
             except (ValueError, TypeError):
                 current_value = 0.0
-            print(f"     eBay: no sales — keeping existing value: ${current_value:.2f}")
+            print(f"     eBay: no sales — keeping existing: ${current_value:.2f}")
 
         graded_gain = round((graded_price or 0.0) - price_paid, 2)
 
         # =====================================================================
-        #  Write enrichment fields back
-        #  Rules:
-        #    - Title, Issue, Grade, CGC Graded, Variant, Price Paid: NEVER touched
-        #    - Publisher, Volume: written only if CV found them
-        #    - Book Link: written only if user left it blank
-        #    - All other enrichment fields: written if CV matched
+        #  Write back
         # =====================================================================
+        test_sheet.at[index, 'Price Paid'] = price_paid
+
         if cv_data:
-            test_sheet.at[index, 'Publisher']   = cv_publisher
-            test_sheet.at[index, 'Volume']      = cv_volume
-            test_sheet.at[index, 'Published']   = published
-            test_sheet.at[index, 'KeyIssue']    = key_issue
-            test_sheet.at[index, 'Cover Price'] = cover_price
-            test_sheet.at[index, 'Comic Age']   = comic_age
-            test_sheet.at[index, 'Notes']       = notes
-            test_sheet.at[index, 'Confidence']  = round(confidence, 4)
-            test_sheet.at[index, 'Cover Image'] = cover_image
+            test_sheet.at[index, 'Publisher']    = cv_data['publisher']
+            # Volume is user-owned (volume number e.g. "Volume 1") — never overwrite
+            test_sheet.at[index, 'Published']    = cv_data['published']
+            test_sheet.at[index, 'KeyIssue']     = cv_data['key_issue']
+            test_sheet.at[index, 'Cover Price']  = cv_data['cover_price']
+            test_sheet.at[index, 'Comic Age']    = cv_data['comic_age']
+            test_sheet.at[index, 'Notes']        = cv_data['notes']
+            test_sheet.at[index, 'Confidence']   = round(cv_data['confidence'], 4)
+            test_sheet.at[index, 'Cover Image']  = cv_data['cover_image']
+            test_sheet.at[index, ID_DATE_COL]    = rundate   # Mark as identified
             if not existing_book_link:
-                test_sheet.at[index, 'Book Link'] = cv_book_link
+                test_sheet.at[index, 'Book Link'] = cv_data['book_link']
 
-        test_sheet.at[index, 'Price Paid']   = price_paid
-        test_sheet.at[index, 'Graded']       = graded_price   if graded_price   is not None else ''
-        test_sheet.at[index, 'Ungraded']     = ungraded_price if ungraded_price is not None else ''
-        test_sheet.at[index, 'Graded Gain']  = graded_gain
-        test_sheet.at[index, 'Value']        = current_value
-        test_sheet.at[index, rundate]        = current_value
+        test_sheet.at[index, 'Graded']      = graded_price   if graded_price   is not None else ''
+        test_sheet.at[index, 'Ungraded']    = ungraded_price if ungraded_price is not None else ''
+        test_sheet.at[index, 'Graded Gain'] = graded_gain
+        test_sheet.at[index, 'Value']       = current_value
+        test_sheet.at[index, rundate]       = current_value
 
-        cv_tag   = f"CV ✓ ({int(confidence*100)}%)" if cv_data else "CV ✗"
-        ebay_tag = f"eBay ✓ ${current_value:.2f}" if stats['ebay_hit'] > stats['ebay_miss'] else f"eBay ✗ (kept ${current_value:.2f})"
-        print(f"     {cv_tag} | {ebay_tag} | {comic_age or 'Age unknown'}")
+        # Status line
+        if cv_data:
+            cv_tag = f"CV ✓ ({int(cv_data['confidence']*100)}%)"
+        elif id_date:
+            cv_tag = f"CV — (done {id_date})"
+        else:
+            cv_tag = "CV ✗"
+        ebay_tag = f"eBay ✓ ${current_value:.2f}" if current_value else "eBay ✗"
+        print(f"     {cv_tag} | {ebay_tag}")
 
     except Exception as e:
         stats['errors'] += 1
@@ -220,14 +228,13 @@ print("✓ Google Sheet updated.")
 # =============================================================================
 #  Results summary
 # =============================================================================
-total     = TEST_LIMIT
-cv_rate   = stats['cv_hit']   / total * 100
-ebay_rate = stats['ebay_hit'] / total * 100
-
+cv_ran  = stats['cv_hit'] + stats['cv_miss']
 print(f"\n{'='*60}")
-print(f"RESULTS ({total} records)")
-print(f"  Comic Vine hits : {stats['cv_hit']:>3}/{total}  ({cv_rate:.0f}%)")
-print(f"  eBay hits       : {stats['ebay_hit']:>3}/{total}  ({ebay_rate:.0f}%)")
+print(f"RESULTS ({TEST_LIMIT} records)")
+print(f"  CV identified   : {stats['cv_hit']:>3}/{cv_ran} ran  ({int(stats['cv_hit']/cv_ran*100) if cv_ran else 0}% hit rate)")
+print(f"  CV skipped      : {stats['cv_skipped']:>3}  (already identified)")
+print(f"  CV missed       : {stats['cv_miss']:>3}  (below confidence threshold)")
+print(f"  eBay hits       : {stats['ebay_hit']:>3}/{TEST_LIMIT}  ({int(stats['ebay_hit']/TEST_LIMIT*100)}%)")
 print(f"  Errors          : {stats['errors']:>3}")
 print(f"{'='*60}")
 print("TEST RUN COMPLETE")

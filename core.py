@@ -16,6 +16,7 @@ from datetime import date
 from urllib.parse import quote_plus
 
 rundate = date.today().strftime("%Y-%m-%d")
+ID_DATE_COL = 'Identification Date'  # Column name for CV identification tracking
 
 CV_BASE = "https://comicvine.gamespot.com/api"
 CV_HEADERS = {"User-Agent": "MyComicCollection/1.0"}
