@@ -1,5 +1,5 @@
 from __future__ import print_function
-import requests
+from curl_cffi import requests
 import bs4
 import time
 from difflib import SequenceMatcher
@@ -8,7 +8,11 @@ import pandas as pd
 import random
 import gspread
 import locale
+import os
 from urllib.parse import quote_plus
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 
 locale.setlocale(locale.LC_ALL, '')
 
@@ -19,26 +23,21 @@ rundate = date.today().strftime("%Y-%m-%d")
 htmlBody = ''
 NO_SEARCH_RESULTS_FOUND = 1
 
-User_Name = input('ComicsPriceGuide.com Username:  ')
-User_Pass = input('ComicsPriceGuide.com Password:  ')
-Google_Workbook = input('Google Workbook Name:    ')
-Google_Sheet = input('Google Worksheet Name:    ')
+User_Name = os.getenv('CPG_USERNAME') or input('ComicsPriceGuide.com Username:  ')
+User_Pass = os.getenv('CPG_PASSWORD') or input('ComicsPriceGuide.com Password:  ')
+Google_Workbook = os.getenv('GOOGLE_WORKBOOK') or input('Google Workbook Name:    ')
+Google_Sheet = os.getenv('GOOGLE_SHEET') or input('Google Worksheet Name:    ')
+CV_API_KEY = os.getenv('CV_API_KEY') or input('Comic Vine API Key:    ')
 
 # =============================================================================
-#   Requests session — replaces Selenium/Chrome entirely
+#   HTTP Sessions
+#   curl_cffi impersonates Chrome TLS fingerprint — bypasses most bot detection
 # =============================================================================
-session = requests.Session()
-session.headers.update({
-    'User-Agent': (
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-        'AppleWebKit/537.36 (KHTML, like Gecko) '
-        'Chrome/120.0.0.0 Safari/537.36'
-    ),
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.5',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Connection': 'keep-alive',
-})
+# Session for Comic Vine + eBay
+session = requests.Session(impersonate="chrome120")
+
+CV_BASE = "https://comicvine.gamespot.com/api"
+CV_HEADERS = {"User-Agent": "MyComicCollection/1.0"}
 
 
 def similar(a, b):
@@ -56,21 +55,168 @@ def _format_grade(g):
     return f"{g:.1f}"
 
 
-def _get_page(url, retries=3, delay_range=(2, 6)):
-    """GET a URL with retry logic. Returns BeautifulSoup and final URL."""
-    for attempt in range(retries):
-        try:
-            time.sleep(random.uniform(*delay_range))
-            resp = session.get(url, timeout=30, allow_redirects=True)
-            resp.raise_for_status()
-            soup = bs4.BeautifulSoup(resp.text, 'html.parser')
-            return soup, resp.url
-        except requests.RequestException as e:
-            print(f"     Request error (attempt {attempt + 1}/{retries}): {e}")
-            if attempt == retries - 1:
-                raise
-    return None, url
+# =============================================================================
+#   Comic Vine API
+# =============================================================================
 
+def _cv_get(endpoint, params):
+    """Make a Comic Vine API call. Returns the parsed JSON results or None."""
+    params.update({
+        'api_key': CV_API_KEY,
+        'format': 'json',
+    })
+    url = f"{CV_BASE}/{endpoint}/"
+    try:
+        time.sleep(random.uniform(1, 2))  # CV rate limit: 200 req/hour
+        resp = session.get(url, params=params, headers=CV_HEADERS, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get('status_code') == 1:
+            return data.get('results')
+        else:
+            print(f"     Comic Vine API error: {data.get('error')} (code {data.get('status_code')})")
+            return None
+    except Exception as e:
+        print(f"     Comic Vine request failed: {e}")
+        return None
+
+
+def SearchComicVine(title, issue, variant=''):
+    """
+    Search Comic Vine for a specific issue.
+    Returns a dict with metadata or None if not found.
+
+    Fields returned:
+      publisher, volume, published, cover_price, comic_age,
+      notes, key_issue, cover_image, book_link, characters
+    """
+    # Search issues by volume name + issue number
+    results = _cv_get('issues', {
+        'filter': f'volume.name:{title},issue_number:{issue}',
+        'field_list': (
+            'id,name,issue_number,volume,description,deck,'
+            'image,cover_date,store_date,cover_price,'
+            'site_detail_url,character_credits,story_arc_credits,'
+            'person_credits'
+        ),
+        'limit': 10,
+    })
+
+    if not results:
+        # Fallback: broader name search
+        print(f"     CV: No exact match — trying name search for '{title}'")
+        results = _cv_get('issues', {
+            'filter': f'name:{title},issue_number:{issue}',
+            'field_list': (
+                'id,name,issue_number,volume,description,deck,'
+                'image,cover_date,store_date,cover_price,'
+                'site_detail_url,character_credits,story_arc_credits'
+            ),
+            'limit': 10,
+        })
+
+    if not results:
+        print(f"     CV: No results found for {title} #{issue}")
+        return None
+
+    # Pick best match by similarity on volume name
+    full_name = f"{title} #{issue}{variant}".upper()
+    best = None
+    best_score = 0
+
+    for r in results:
+        vol_name = r.get('volume', {}).get('name', '') if r.get('volume') else ''
+        candidate = f"{vol_name} #{r.get('issue_number', '')}".upper()
+        score = similar(candidate, full_name)
+        if score > best_score:
+            best_score = score
+            best = r
+
+    if best is None or best_score < 0.3:
+        print(f"     CV: Best match confidence too low ({int(best_score*100)}%) — skipping")
+        return None
+
+    print(f"     CV: Matched '{best.get('volume', {}).get('name', '')} #{best.get('issue_number')}' "
+          f"(confidence {int(best_score*100)}%)")
+
+    # Extract cover date / comic age
+    cover_date = best.get('cover_date') or best.get('store_date') or 'Unknown'
+    comic_age = _classify_age(cover_date)
+
+    # Key issue: flag if description/deck mentions it, or has notable story arcs
+    description = best.get('description') or ''
+    deck = best.get('deck') or ''
+    key_issue = 'Yes' if any(kw in (description + deck).lower() for kw in [
+        'key issue', 'first appearance', '1st appearance', 'origin', 'death of',
+        'first app', '1st app'
+    ]) else 'No'
+
+    # Cover image
+    image = ''
+    if best.get('image'):
+        image = best['image'].get('original_url') or best['image'].get('medium_url') or ''
+
+    # Characters
+    chars = best.get('character_credits') or []
+    characters = ', '.join([c.get('name', '') for c in chars[:10]])
+
+    # Publisher
+    publisher = ''
+    if best.get('volume') and best['volume'].get('api_detail_url'):
+        # Publisher is on the volume — fetch it if not already in result
+        vol = best.get('volume', {})
+        publisher = vol.get('publisher', {}).get('name', '') if vol.get('publisher') else ''
+        if not publisher:
+            # Volume detail has publisher — make a quick extra call
+            vol_results = _cv_get(f"volume/{vol.get('id', '')}", {
+                'field_list': 'publisher'
+            }) if vol.get('id') else None
+            if vol_results and isinstance(vol_results, dict):
+                publisher = vol_results.get('publisher', {}).get('name', '') or ''
+
+    return {
+        'publisher': publisher,
+        'volume': best.get('volume', {}).get('name', '') if best.get('volume') else '',
+        'published': cover_date,
+        'cover_price': best.get('cover_price') or 'Unknown',
+        'comic_age': comic_age,
+        'notes': deck or _strip_html(description[:500]) if description else '',
+        'key_issue': key_issue,
+        'cover_image': image,
+        'book_link': best.get('site_detail_url') or '',
+        'characters': characters,
+        'confidence': best_score,
+    }
+
+
+def _strip_html(text):
+    """Strip HTML tags from a string."""
+    return bs4.BeautifulSoup(text, 'html.parser').get_text(separator=' ').strip()
+
+
+def _classify_age(cover_date):
+    """Classify a comic into Golden/Silver/Bronze/Copper/Modern Age by cover date."""
+    if not cover_date or cover_date == 'Unknown':
+        return 'Unknown'
+    try:
+        year = int(str(cover_date)[:4])
+        if year < 1956:
+            return 'Golden Age'
+        elif year < 1970:
+            return 'Silver Age'
+        elif year < 1985:
+            return 'Bronze Age'
+        elif year < 1992:
+            return 'Copper Age'
+        else:
+            return 'Modern Age'
+    except (ValueError, TypeError):
+        return 'Unknown'
+
+
+# =============================================================================
+#   eBay Pricing
+# =============================================================================
 
 def _ebay_sold_prices(query):
     """
@@ -83,8 +229,11 @@ def _ebay_sold_prices(query):
         "&LH_Sold=1&LH_Complete=1&_sop=13"
     )
     try:
-        soup, _ = _get_page(search_url, delay_range=(1, 3))
-    except requests.RequestException:
+        time.sleep(random.uniform(1, 3))
+        resp = session.get(search_url, timeout=30)
+        soup = bs4.BeautifulSoup(resp.text, 'html.parser')
+    except Exception as e:
+        print(f"     eBay request failed: {e}")
         return []
 
     prices = []
@@ -177,94 +326,13 @@ def GetEbayPrice(title, issue, grade, cgc, variant=''):
     return None
 
 
-def LoginComicsPriceGuide(User_Name, User_Pass):
-    """
-    Log into ComicsPriceGuide.com using a requests session.
-    Discovers the login form dynamically to handle CSRF tokens or hidden fields.
-    """
-    print("Logging into ComicsPriceGuide.com...")
-    resp = session.get("https://comicspriceguide.com/login", timeout=30)
-    soup = bs4.BeautifulSoup(resp.text, 'html.parser')
-
-    # Build payload from all hidden form fields (captures CSRF tokens etc.)
-    form = soup.find('form')
-    payload = {}
-    action = 'https://comicspriceguide.com/login'
-    if form:
-        for hidden in form.find_all('input', {'type': 'hidden'}):
-            if hidden.get('name'):
-                payload[hidden['name']] = hidden.get('value', '')
-        raw_action = form.get('action', '/login')
-        action = raw_action if raw_action.startswith('http') else f"https://comicspriceguide.com{raw_action}"
-
-    payload['user_username'] = User_Name
-    payload['user_password'] = User_Pass
-
-    time.sleep(random.uniform(1, 3))
-    resp = session.post(action, data=payload, timeout=30, allow_redirects=True)
-
-    # Verify login succeeded by checking for logout link or user-specific content
-    if 'logout' in resp.text.lower() or 'sign out' in resp.text.lower():
-        print("Login successful.")
-    else:
-        print(f"WARNING: Login may have failed (HTTP {resp.status_code}). Continuing anyway.")
-
-    time.sleep(random.uniform(1, 3))
-
-
-def SearchComic(Title, Issue, fullName, thisComic):
-    """
-    Search ComicsPriceGuide for a comic by title and issue.
-    Returns [best_match_url, confidence_percentage].
-    """
-    print(fullName + " - Searching...")
-
-    # GET the search page to discover the form structure
-    resp = session.get("https://comicspriceguide.com/Search", timeout=30)
-    soup = bs4.BeautifulSoup(resp.text, 'html.parser')
-
-    form = soup.find('form')
-    payload = {}
-    action = 'https://comicspriceguide.com/Search'
-    if form:
-        for hidden in form.find_all('input', {'type': 'hidden'}):
-            if hidden.get('name'):
-                payload[hidden['name']] = hidden.get('value', '')
-        raw_action = form.get('action', '/Search')
-        action = raw_action if raw_action.startswith('http') else f"https://comicspriceguide.com{raw_action}"
-
-    payload['search'] = Title
-    payload['issueNu'] = str(Issue)
-
-    time.sleep(random.uniform(2, 8))
-    resp = session.post(action, data=payload, timeout=30, allow_redirects=True)
-    soup = bs4.BeautifulSoup(resp.text, 'html.parser')
-
-    similarity = 0
-    comic_link = ''
-    percentage = 0
-
-    for candidate in soup.find_all('a', attrs={'class': 'grid_issue'}):
-        a = str(candidate.text).replace("<sup>#</sup>", "#").upper()
-        pct = similar(a, fullName)
-        if pct > similarity:
-            similarity = pct
-            percentage = pct
-            comic_link = 'https://comicspriceguide.com' + str(candidate["href"])
-
-    if percentage > 0:
-        print("     Found a match, confidence: " + str(int(percentage * 100)) + "% - " + comic_link)
-    else:
-        percentage = None
-        print(str(thisComic['Title']) + " #" + str(thisComic['Issue']) + " - " + str(thisComic['Book Link']))
-        comic_link = thisComic['Book Link']
-
-    return [comic_link, percentage]
-
+# =============================================================================
+#   HTML Report
+# =============================================================================
 
 def generate_HTMLPage(sortedsheet):
     global htmlBody
-    htmlBody = ''  # Reset so re-runs don't append to stale content
+    htmlBody = ''
 
     for index, thisComic in sortedsheet.iterrows():
         title = str(thisComic['Title']).strip().upper()
@@ -325,11 +393,11 @@ def generate_HTMLPage(sortedsheet):
         f.write(htmlBody)
 
 
+# =============================================================================
+#   Google Sheets
+# =============================================================================
+
 def ReadGoogleSheet(Google_Workbook, Google_Sheet):
-    """
-    Read Google Sheet into a pandas DataFrame.
-    Requires service account at ~/.config/gspread/service_account.json
-    """
     gc = gspread.service_account()
     sh = gc.open(Google_Workbook)
     worksheet = sh.worksheet(Google_Sheet)
@@ -339,7 +407,6 @@ def ReadGoogleSheet(Google_Workbook, Google_Sheet):
 
 
 def BackupGoogleSheet(sh, Starting_DF, sortedsheet):
-    """Create a dated backup worksheet in the same Google Workbook."""
     starting_rows = Starting_DF.shape[0]
     starting_cols = Starting_DF.shape[1]
     backup = sh.add_worksheet(title="Backup " + rundate, rows=starting_rows, cols=starting_cols)
@@ -358,19 +425,17 @@ sh = SheetData[3]
 generate_HTMLPage(sortedsheet)
 BackupGoogleSheet(sh, StartingDF, sortedsheet)
 
-LoginComicsPriceGuide(User_Name, User_Pass)
-
 for index, thisComic in sortedsheet.iterrows():
     try:
-        # =============================================================================
+        # =====================================================================
         #  Fetch required data fields
-        # =============================================================================
+        # =====================================================================
         title = str(thisComic['Title']).strip().upper()
         issue = int(str(thisComic['Issue']).strip())
         grade = str(thisComic['Grade']).strip()
         cgc = "No" if thisComic['CGC Graded'] is None else thisComic['CGC Graded']
         variant = '' if str(thisComic['Variant']).strip() == 'nan' else str(thisComic['Variant']).strip()
-        url = '' if str(thisComic['Book Link']).strip() == 'nan' else str(thisComic['Book Link']).strip()
+        fullName = title + " #" + str(issue) + variant
 
         price_paid = 0.0
         raw_paid = thisComic['Price Paid']
@@ -383,96 +448,70 @@ for index, thisComic in sortedsheet.iterrows():
             print(f'WARNING: Could not parse Price Paid value: {raw_paid!r}')
 
         if price_paid == 0:
-            price_paid = 0.01  # Avoid divide-by-zero in ROI calculations
+            price_paid = 0.01
 
         sortedsheet.at[index, 'Price Paid'] = price_paid
-        fullName = title + " #" + str(issue) + variant
-        confidence = ''
         print('Gathering : ' + fullName)
 
-        if url == '':
-            print('No direct URL - Calling search')
-            search_results_Array = SearchComic(title, issue, fullName, thisComic)
-            url = search_results_Array[0]
-            confidence = search_results_Array[1]
+        # =====================================================================
+        #  Comic Vine — metadata lookup
+        # =====================================================================
+        cv_data = SearchComicVine(title, issue, variant)
 
-        # =============================================================================
-        #  A match has been determined - get the details
-        # =============================================================================
-        if url == '':
-            raise ValueError(NO_SEARCH_RESULTS_FOUND,
-                             "Looks like the search gave no result.",
-                             thisComic['Title'], thisComic['Issue'])
+        if cv_data:
+            publisher    = cv_data['publisher']
+            volume       = cv_data['volume']
+            published    = cv_data['published']
+            cover_price  = cv_data['cover_price']
+            comic_age    = cv_data['comic_age']
+            notes        = cv_data['notes']
+            keyIssue     = cv_data['key_issue']
+            image        = cv_data['cover_image']
+            url_link     = cv_data['book_link']
+            confidence   = cv_data['confidence']
+        else:
+            # Preserve existing sheet values if CV lookup fails
+            publisher   = str(thisComic.get('Publisher', ''))
+            volume      = str(thisComic.get('Volume', ''))
+            published   = str(thisComic.get('Published', 'Unknown'))
+            cover_price = str(thisComic.get('Cover Price', 'Unknown'))
+            comic_age   = str(thisComic.get('Comic Age', 'Unknown'))
+            notes       = str(thisComic.get('Notes', ''))
+            keyIssue    = str(thisComic.get('KeyIssue', 'No'))
+            image       = str(thisComic.get('Cover Image', ''))
+            url_link    = str(thisComic.get('Book Link', ''))
+            confidence  = None
+            print(f"     CV lookup failed — preserving existing sheet values")
 
-        time.sleep(random.uniform(5, 15))
-        soup, final_url = _get_page(url)
-
-        publisher = soup.find('a', attrs={'id': 'hypPub'}).text
-        volume = soup.find('span', attrs={'id': 'lblVolume'}).text
-        notes = soup.find('span', attrs={'id': 'spQComment'}).text
-        keyIssue = "Yes" if "Key Issue" in soup.text else "No"
-        image = soup.find('img', attrs={'id': 'imgCoverMn'})['src']
-        if image[0:4] != 'http':
-            image = 'https://comicspriceguide.com/' + image
-
-        basic_info = []
-        for s in soup.find_all('div', attrs={"class": "m-0 f-12"}):
-            basic_info.append(s.parent.find('span', attrs={"class": "f-11"}).text.replace("   ", " "))
-        published = basic_info[0] if basic_info[0] != " ADD" else "Unknown"
-        comic_age = basic_info[1] if basic_info[1] != " ADD" else "Unknown"
-        cover_price = basic_info[2] if basic_info[2] != " ADD" else "Unknown"
-
-        # =============================================================================
-        #  Get prices from CPG price table
-        # =============================================================================
+        # =====================================================================
+        #  eBay — market pricing
+        # =====================================================================
         if len(grade) < 3:
             grade = grade + ".0"
 
-        priceTable = soup.find(name='table', attrs={"id": "pricetable"})
-        pricesdf = pd.read_html(priceTable.prettify())[0]
-        pricesdf['Condition'] = pricesdf['Condition'].str[:3]
-        pricesdf = pricesdf.rename(columns={'Graded Value  *': 'Graded Value'})
-        thisbooksgrade = pricesdf.loc[pricesdf['Condition'] == grade]
-        RawValue = float(thisbooksgrade['Raw Value'].iloc[0].replace('$', ''))
-        GradedValue = float(thisbooksgrade['Graded Value'].iloc[0].replace('$', ''))
-        cpg_value = RawValue if cgc.upper() == 'NO' else GradedValue
+        value = GetEbayPrice(title, issue, grade, cgc, variant)
+        if value is None:
+            # Fall back to existing sheet value if eBay has nothing
+            try:
+                value = float(str(thisComic.get('Value', '0')).replace('$', '').replace(',', '')) or 0.0
+            except (ValueError, TypeError):
+                value = 0.0
+            print(f"     eBay unavailable — keeping existing value: ${value:.2f}")
 
-        # --- eBay pricing ---
-        ebay_value = GetEbayPrice(title, issue, grade, cgc, variant)
-        if ebay_value is not None:
-            value = ebay_value
-            print(f"     Using eBay price: ${value:.2f} (CPG guide: ${cpg_value:.2f})")
-        else:
-            value = cpg_value
-            print(f"     eBay price unavailable – falling back to CPG guide: ${value:.2f}")
-
-        characters_info = (
-            soup.find('div', attrs={'id': 'dvCharacterList'}).text
-            if soup.find('div', attrs={'id': 'dvCharacterList'}) is not None
-            else "No Info Found"
-        )
-        story = soup.find('div', attrs={'id': 'dvStoryList'}).text.replace("Stories may contain spoilers", "")
-
-        # =============================================================================
+        # =====================================================================
         #  Update the DataFrame
-        # =============================================================================
-        sortedsheet.at[index, 'Publisher'] = publisher
-        sortedsheet.at[index, 'Volume'] = volume
-        sortedsheet.at[index, 'Published'] = published
-        sortedsheet.at[index, 'KeyIssue'] = keyIssue
+        # =====================================================================
+        sortedsheet.at[index, 'Publisher']   = publisher
+        sortedsheet.at[index, 'Volume']      = volume
+        sortedsheet.at[index, 'Published']   = published
+        sortedsheet.at[index, 'KeyIssue']    = keyIssue
         sortedsheet.at[index, 'Cover Price'] = cover_price
-        sortedsheet.at[index, 'Comic Age'] = comic_age
-        sortedsheet.at[index, 'Notes'] = notes
-        sortedsheet.at[index, 'Confidence'] = confidence if confidence != '' else None
-        sortedsheet.at[index, 'Book Link'] = final_url
-        sortedsheet.at[index, 'Graded'] = GradedValue
-        sortedsheet.at[index, 'Ungraded'] = RawValue
+        sortedsheet.at[index, 'Comic Age']   = comic_age
+        sortedsheet.at[index, 'Notes']       = notes
+        sortedsheet.at[index, 'Confidence']  = confidence
+        sortedsheet.at[index, 'Book Link']   = url_link
         sortedsheet.at[index, 'Cover Image'] = image
-        sortedsheet.at[index, rundate] = value
-
-    except ValueError as ve:
-        if ve.args[0] == NO_SEARCH_RESULTS_FOUND:
-            print("     Unable to find Match for " + str(ve.args[2]) + " #" + str(ve.args[3]))
+        sortedsheet.at[index, rundate]       = value
 
     except Exception as e:
         print("Error while working on " + title + ' ' + str(e))
