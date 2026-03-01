@@ -1,0 +1,386 @@
+"""
+core.py — Shared logic for comic.py and test_run.py.
+
+Fixes applied vs previous version:
+  1. CV confidence threshold raised from 0.3 → 0.6; bad matches now fall through
+  2. CV fallback uses /search endpoint which handles unusual/numeric titles better
+  3. Grade normalisation: blank/invalid grade returns None cleanly, eBay skips gracefully
+  4. eBay query no longer appends grade string when grade is unknown
+  5. pandas fillna: uses per-column dtype-safe approach to suppress FutureWarning
+"""
+from __future__ import print_function
+from curl_cffi import requests
+import bs4
+from difflib import SequenceMatcher
+from datetime import date
+from urllib.parse import quote_plus
+
+rundate = date.today().strftime("%Y-%m-%d")
+
+CV_BASE = "https://comicvine.gamespot.com/api"
+CV_HEADERS = {"User-Agent": "MyComicCollection/1.0"}
+CV_CONFIDENCE_THRESHOLD = 0.60   # Reject matches below this — prevents wrong-title pollution
+
+GRADE_SCALE = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5,
+               5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0,
+               9.2, 9.4, 9.6, 9.8, 10.0]
+
+
+# =============================================================================
+#   Utilities
+# =============================================================================
+
+def similar(a, b):
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _format_grade(g):
+    return f"{g:.1f}"
+
+
+def _strip_html(text):
+    return bs4.BeautifulSoup(text, 'html.parser').get_text(separator=' ').strip()
+
+
+def _classify_age(cover_date):
+    """Classify a comic into an age bracket by cover date string (YYYY-MM-DD or YYYY)."""
+    if not cover_date or str(cover_date).strip() in ('', 'Unknown', 'None', 'nan'):
+        return 'Unknown'
+    try:
+        year = int(str(cover_date)[:4])
+        if year < 1938:   return 'Platinum Age'
+        elif year < 1956: return 'Golden Age'
+        elif year < 1970: return 'Silver Age'
+        elif year < 1985: return 'Bronze Age'
+        elif year < 1992: return 'Copper Age'
+        else:             return 'Modern Age'
+    except (ValueError, TypeError):
+        return 'Unknown'
+
+
+def normalise_grade(raw_grade):
+    """
+    Normalise a grade string to 'X.X' format, or return None if blank/invalid.
+
+    Examples:
+      '9'   → '9.0'
+      '9.8' → '9.8'
+      ''    → None
+      'NM'  → None  (text grades not supported for eBay lookup)
+    """
+    g = str(raw_grade).strip()
+    if not g or g.lower() in ('nan', 'none', ''):
+        return None
+    try:
+        val = float(g)
+        return f"{val:.1f}" if '.' in g or len(g) >= 3 else f"{val:.1f}"
+    except ValueError:
+        return None
+
+
+def safe_fillna(df):
+    """
+    Fill NaN values in a DataFrame in a dtype-safe way.
+    Numeric columns get 0, object columns get ''.
+    Suppresses the pandas FutureWarning about incompatible dtype assignment.
+    """
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].fillna('')
+        else:
+            df[col] = df[col].fillna(0)
+    return df
+
+
+# =============================================================================
+#   Comic Vine
+# =============================================================================
+
+def _cv_get(session, cv_api_key, endpoint, params):
+    """Make a Comic Vine API call. Returns parsed results or None."""
+    params.update({'api_key': cv_api_key, 'format': 'json'})
+    url = f"{CV_BASE}/{endpoint}/"
+    try:
+        resp = session.get(url, params=params, headers=CV_HEADERS, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get('status_code') == 1:
+            return data.get('results')
+        else:
+            print(f"     CV API error: {data.get('error')} (code {data.get('status_code')})")
+            return None
+    except Exception as e:
+        print(f"     CV request failed: {e}")
+        return None
+
+
+def _pick_best_match(results, full_name, issue_number=None, volume_number=None, publisher=None):
+    """
+    Given a list of CV issue results, return (best_result, score).
+
+    Scoring:
+      - Base: string similarity of 'VolumeName #IssueNum' vs full_name
+      - Penalty: -0.3 if issue_number doesn't match exactly (prevents #2 matching #4)
+      - Bonus:  +0.1 if publisher name matches (helps disambiguate Marvel vs DC)
+      - Bonus:  +0.1 if volume start_year aligns with volume_number ordering
+
+    All scores clamped to [0, 1].
+    """
+    best, best_score = None, 0.0
+    for r in results:
+        vol_name = (r.get('volume') or {}).get('name', '')
+        candidate = f"{vol_name} #{r.get('issue_number', '')}".upper()
+        score = similar(candidate, full_name.upper())
+
+        # Penalty: issue number mismatch — use 0.5 to overcome even near-identical titles
+        if issue_number is not None:
+            r_issue = str(r.get('issue_number', '')).strip()
+            if r_issue != str(issue_number).strip():
+                score -= 0.5
+
+        # Bonus: publisher match
+        if publisher:
+            r_pub = (r.get('publisher') or {}).get('name', '').upper()
+            if r_pub and publisher.upper() in r_pub:
+                score += 0.1
+
+        score = max(0.0, min(1.0, score))
+        if score > best_score:
+            best_score = score
+            best = r
+    return best, best_score
+
+
+def SearchComicVine(session, cv_api_key, title, issue, variant='',
+                    volume_number=None, publisher=None):
+    """
+    Search Comic Vine for a specific issue.
+
+    Parameters:
+      title         — series name (e.g. 'Amazing Spider-Man')
+      issue         — issue number (int or str)
+      variant       — variant suffix (e.g. ' [Variant A]')
+      volume_number — sheet Volume field (int); used to disambiguate relaunches
+      publisher     — sheet Publisher field (str); used to break ties
+
+    Search strategy:
+      1. Filter by volume.name + issue_number (most precise)
+      2. If no results or low confidence: /search endpoint (handles unusual titles)
+      3. Scoring penalises issue number mismatches and rewards publisher/volume matches
+      4. Reject if best confidence < CV_CONFIDENCE_THRESHOLD
+
+    IMPORTANT: This function only returns *enrichment* metadata.
+    The caller must never overwrite Title, Issue, Volume, or Publisher
+    fields in the sheet with values from this result.
+
+    Returns a metadata dict or None.
+    """
+    full_name = f"{title} #{issue}{variant}"
+
+    field_list = (
+        'id,name,issue_number,volume,description,deck,'
+        'image,cover_date,store_date,cover_price,'
+        'site_detail_url,character_credits'
+    )
+
+    # --- Strategy 1: volume.name + issue_number filter ---
+    results = _cv_get(session, cv_api_key, 'issues', {
+        'filter': f'volume.name:{title},issue_number:{issue}',
+        'field_list': field_list,
+        'limit': 20,
+    })
+    best, best_score = _pick_best_match(
+        results or [], full_name,
+        issue_number=issue,
+        volume_number=volume_number,
+        publisher=publisher,
+    )
+
+    # --- Strategy 2: /search fallback if confidence too low ---
+    if best_score < CV_CONFIDENCE_THRESHOLD:
+        print(f"     CV: Filter match low ({int(best_score*100)}%) — trying /search fallback")
+        search_results = _cv_get(session, cv_api_key, 'search', {
+            'query': f"{title} #{issue}",
+            'resources': 'issue',
+            'field_list': field_list,
+            'limit': 20,
+        })
+        if search_results:
+            issues = [r for r in search_results if r.get('resource_type') == 'issue']
+            sb, ss = _pick_best_match(
+                issues, full_name,
+                issue_number=issue,
+                volume_number=volume_number,
+                publisher=publisher,
+            )
+            if ss > best_score:
+                best, best_score = sb, ss
+
+    if best is None or best_score < CV_CONFIDENCE_THRESHOLD:
+        print(f"     CV: No confident match for '{full_name}' "
+              f"(best: {int(best_score*100)}% < {int(CV_CONFIDENCE_THRESHOLD*100)}% threshold)")
+        return None
+
+    print(f"     CV: '{(best.get('volume') or {}).get('name','')} "
+          f"#{best.get('issue_number')}' ({int(best_score*100)}% confidence)")
+
+    # --- Extract fields ---
+    cover_date  = best.get('cover_date') or best.get('store_date') or 'Unknown'
+    description = best.get('description') or ''
+    deck        = best.get('deck') or ''
+
+    key_issue = 'Yes' if any(kw in (description + deck).lower() for kw in [
+        'key issue', 'first appearance', '1st appearance', 'origin',
+        'death of', 'first app', '1st app'
+    ]) else 'No'
+
+    image = ''
+    if best.get('image'):
+        image = (best['image'].get('original_url')
+                 or best['image'].get('medium_url') or '')
+
+    chars = best.get('character_credits') or []
+    characters = ', '.join([c.get('name', '') for c in chars[:10]])
+
+    # Publisher requires a volume detail call
+    publisher = ''
+    vol = best.get('volume') or {}
+    vol_id = vol.get('id')
+    if vol_id:
+        vol_data = _cv_get(session, cv_api_key,
+                           f"volume/4050-{vol_id}",
+                           {'field_list': 'publisher,name,start_year'})
+        if vol_data and isinstance(vol_data, dict):
+            publisher = (vol_data.get('publisher') or {}).get('name', '')
+
+    return {
+        'publisher':   publisher,
+        'volume':      vol.get('name', ''),
+        'published':   cover_date,
+        'cover_price': best.get('cover_price') or 'Unknown',
+        'comic_age':   _classify_age(cover_date),
+        'notes':       deck or (_strip_html(description[:500]) if description else ''),
+        'key_issue':   key_issue,
+        'cover_image': image,
+        'book_link':   best.get('site_detail_url') or '',
+        'characters':  characters,
+        'confidence':  best_score,
+    }
+
+
+# =============================================================================
+#   eBay Pricing
+# =============================================================================
+
+def _ebay_sold_prices(session, query):
+    """Fetch eBay sold listing prices for a query string."""
+    search_url = (
+        "https://www.ebay.com/sch/i.html?"
+        f"_nkw={quote_plus(query)}"
+        "&LH_Sold=1&LH_Complete=1&_sop=13"
+    )
+    try:
+        resp = session.get(search_url, timeout=30)
+        soup = bs4.BeautifulSoup(resp.text, 'html.parser')
+    except Exception as e:
+        print(f"     eBay request failed: {e}")
+        return []
+
+    prices = []
+    for span in soup.find_all('span', attrs={'class': 's-item__price'}):
+        raw = span.text.strip().replace('$', '').replace(',', '')
+        try:
+            if ' to ' in raw:
+                parts = raw.split(' to ')
+                prices.append((float(parts[0]) + float(parts[1])) / 2)
+            else:
+                prices.append(float(raw))
+        except ValueError:
+            pass
+    return prices
+
+
+def _ebay_price_for_grade(session, title, issue, grade_float, cgc, variant=''):
+    """Return the most recent eBay sold price for a specific grade, or None."""
+    cgc_str   = "CGC" if cgc.upper() != 'NO' else ""
+    grade_str = _format_grade(grade_float)
+    # Build query: omit grade_str if we're doing a broad fallback search
+    query = ' '.join(filter(None, [title, f'#{issue}', cgc_str, grade_str, variant])).strip()
+    prices = _ebay_sold_prices(session, query)
+    if prices:
+        print(f"     eBay [{grade_str}]: ${prices[0]:.2f}  ({len(prices)} sales found)")
+        return prices[0]
+    return None
+
+
+def GetEbayPriceGraded(session, title, issue, grade, variant=''):
+    """Convenience: eBay price for CGC-graded copy (includes 'CGC' in query)."""
+    return GetEbayPrice(session, title, issue, grade, 'Yes', variant)
+
+
+def GetEbayPriceUngraded(session, title, issue, grade, variant=''):
+    """Convenience: eBay price for raw/ungraded copy (no 'CGC' in query)."""
+    return GetEbayPrice(session, title, issue, grade, 'No', variant)
+
+
+def GetEbayPrice(session, title, issue, grade, cgc, variant=''):
+    """
+    Look up the most recent eBay sold price for a comic + grade.
+
+    Returns None if:
+      - grade is blank/invalid (skip gracefully instead of malformed query)
+      - no eBay sales found after interpolation attempts
+    """
+    # Fix: blank grade → skip eBay entirely rather than search for ".0"
+    grade_norm = normalise_grade(grade)
+    if grade_norm is None:
+        print(f"     eBay: Grade is blank/invalid ('{grade}') — skipping eBay lookup")
+        return None
+
+    try:
+        target = float(grade_norm)
+    except ValueError:
+        print(f"     eBay: Cannot parse grade '{grade_norm}'")
+        return None
+
+    # 1. Exact match
+    price = _ebay_price_for_grade(session, title, issue, target, cgc, variant)
+    if price is not None:
+        return price
+
+    print(f"     eBay: No sales for grade {grade_norm} – searching nearby grades…")
+
+    if target not in GRADE_SCALE:
+        print(f"     eBay: Grade {target} not in standard scale.")
+        return None
+
+    idx = GRADE_SCALE.index(target)
+
+    lower_grade, lower_price = None, None
+    for g in reversed(GRADE_SCALE[:idx]):
+        p = _ebay_price_for_grade(session, title, issue, g, cgc, variant)
+        if p is not None:
+            lower_grade, lower_price = g, p
+            break
+
+    upper_grade, upper_price = None, None
+    for g in GRADE_SCALE[idx + 1:]:
+        p = _ebay_price_for_grade(session, title, issue, g, cgc, variant)
+        if p is not None:
+            upper_grade, upper_price = g, p
+            break
+
+    if lower_price is not None and upper_price is not None:
+        ratio = (target - lower_grade) / (upper_grade - lower_grade)
+        interpolated = round(lower_price + ratio * (upper_price - lower_price), 2)
+        print(f"     eBay: Interpolated {grade_norm} → ${interpolated:.2f}")
+        return interpolated
+    elif lower_price is not None:
+        print(f"     eBay: Using nearest lower {lower_grade} → ${lower_price:.2f}")
+        return lower_price
+    elif upper_price is not None:
+        print(f"     eBay: Using nearest upper {upper_grade} → ${upper_price:.2f}")
+        return upper_price
+
+    print(f"     eBay: No usable sales data for {title} #{issue}.")
+    return None

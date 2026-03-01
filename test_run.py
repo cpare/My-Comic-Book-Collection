@@ -1,350 +1,211 @@
 """
-test_run.py — Runs comic.py logic against the first 10 records only.
-Reads credentials from .env, no interactive prompts needed.
+test_run.py — Integration test against live Google Sheet + APIs.
+Processes first N records, writes results back, reports success rate.
+
+Input fields (user-owned, never overwritten):
+  Title, Issue, Grade, CGC Graded, Variant, Price Paid, Book Link (if pre-populated)
+
+Output/enrichment fields (written by this script):
+  Publisher, Volume, Published, KeyIssue, Cover Price, Comic Age, Notes,
+  Confidence, Book Link (only if blank), Cover Image,
+  Graded, Ungraded, Graded Gain, Value, <rundate>
 """
 from __future__ import print_function
 from curl_cffi import requests
-import bs4
-import time
-from difflib import SequenceMatcher
+import re
 from datetime import date
 import pandas as pd
-import random
 import gspread
 import locale
 import os
-from urllib.parse import quote_plus
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
+from core import (
+    SearchComicVine,
+    GetEbayPrice,
+    GetEbayPriceGraded,
+    GetEbayPriceUngraded,
+    safe_fillna,
+    normalise_grade,
+    rundate,
+)
 
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 locale.setlocale(locale.LC_ALL, '')
 
-rundate = date.today().strftime("%Y-%m-%d")
-NO_SEARCH_RESULTS_FOUND = 1
-TEST_LIMIT = 10
-
+TEST_LIMIT      = 20
 Google_Workbook = os.getenv('GOOGLE_WORKBOOK') or input('Google Workbook Name: ')
 Google_Sheet    = os.getenv('GOOGLE_SHEET')    or input('Google Sheet Name: ')
 CV_API_KEY      = os.getenv('CV_API_KEY')      or input('Comic Vine API Key: ')
 
 session = requests.Session(impersonate="chrome120")
-CV_BASE = "https://comicvine.gamespot.com/api"
-CV_HEADERS = {"User-Agent": "MyComicCollection/1.0"}
-
-GRADE_SCALE = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5,
-               5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0,
-               9.2, 9.4, 9.6, 9.8, 10.0]
-
-
-def similar(a, b):
-    return SequenceMatcher(None, a, b).ratio()
-
-
-def _format_grade(g):
-    return f"{g:.1f}"
-
-
-def _strip_html(text):
-    return bs4.BeautifulSoup(text, 'html.parser').get_text(separator=' ').strip()
-
-
-def _classify_age(cover_date):
-    if not cover_date or cover_date == 'Unknown':
-        return 'Unknown'
-    try:
-        year = int(str(cover_date)[:4])
-        if year < 1956:   return 'Golden Age'
-        elif year < 1970: return 'Silver Age'
-        elif year < 1985: return 'Bronze Age'
-        elif year < 1992: return 'Copper Age'
-        else:             return 'Modern Age'
-    except (ValueError, TypeError):
-        return 'Unknown'
-
 
 # =============================================================================
-#   Comic Vine
-# =============================================================================
-
-def _cv_get(endpoint, params):
-    params.update({'api_key': CV_API_KEY, 'format': 'json'})
-    url = f"{CV_BASE}/{endpoint}/"
-    try:
-        time.sleep(random.uniform(1, 2))
-        resp = session.get(url, params=params, headers=CV_HEADERS, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get('status_code') == 1:
-            return data.get('results')
-        else:
-            print(f"     CV API error: {data.get('error')} (code {data.get('status_code')})")
-            return None
-    except Exception as e:
-        print(f"     CV request failed: {e}")
-        return None
-
-
-def SearchComicVine(title, issue, variant=''):
-    results = _cv_get('issues', {
-        'filter': f'volume.name:{title},issue_number:{issue}',
-        'field_list': (
-            'id,name,issue_number,volume,description,deck,'
-            'image,cover_date,store_date,cover_price,'
-            'site_detail_url,character_credits'
-        ),
-        'limit': 10,
-    })
-
-    if not results:
-        print(f"     CV: No exact match — trying name search")
-        results = _cv_get('issues', {
-            'filter': f'name:{title},issue_number:{issue}',
-            'field_list': (
-                'id,name,issue_number,volume,description,deck,'
-                'image,cover_date,store_date,cover_price,'
-                'site_detail_url,character_credits'
-            ),
-            'limit': 10,
-        })
-
-    if not results:
-        print(f"     CV: No results for {title} #{issue}")
-        return None
-
-    full_name = f"{title} #{issue}{variant}".upper()
-    best, best_score = None, 0
-
-    for r in results:
-        vol_name = r.get('volume', {}).get('name', '') if r.get('volume') else ''
-        candidate = f"{vol_name} #{r.get('issue_number', '')}".upper()
-        score = similar(candidate, full_name)
-        if score > best_score:
-            best_score = score
-            best = r
-
-    if best is None or best_score < 0.3:
-        print(f"     CV: Best match too low ({int(best_score*100)}%) — skipping")
-        return None
-
-    print(f"     CV: '{best.get('volume', {}).get('name', '')} #{best.get('issue_number')}' "
-          f"({int(best_score*100)}% confidence)")
-
-    cover_date = best.get('cover_date') or best.get('store_date') or 'Unknown'
-    description = best.get('description') or ''
-    deck = best.get('deck') or ''
-    key_issue = 'Yes' if any(kw in (description + deck).lower() for kw in [
-        'key issue', 'first appearance', '1st appearance', 'origin',
-        'death of', 'first app', '1st app'
-    ]) else 'No'
-
-    image = ''
-    if best.get('image'):
-        image = best['image'].get('original_url') or best['image'].get('medium_url') or ''
-
-    chars = best.get('character_credits') or []
-    characters = ', '.join([c.get('name', '') for c in chars[:10]])
-
-    publisher = ''
-    vol = best.get('volume') or {}
-    if vol.get('id'):
-        vol_data = _cv_get(f"volume/4050-{vol['id']}", {'field_list': 'publisher,name,start_year'})
-        if vol_data and isinstance(vol_data, dict):
-            publisher = (vol_data.get('publisher') or {}).get('name', '')
-
-    return {
-        'publisher':   publisher,
-        'volume':      vol.get('name', ''),
-        'published':   cover_date,
-        'cover_price': best.get('cover_price') or 'Unknown',
-        'comic_age':   _classify_age(cover_date),
-        'notes':       deck or _strip_html(description[:500]),
-        'key_issue':   key_issue,
-        'cover_image': image,
-        'book_link':   best.get('site_detail_url') or '',
-        'characters':  characters,
-        'confidence':  best_score,
-    }
-
-
-# =============================================================================
-#   eBay Pricing
-# =============================================================================
-
-def _ebay_sold_prices(query):
-    search_url = (
-        "https://www.ebay.com/sch/i.html?"
-        f"_nkw={quote_plus(query)}"
-        "&LH_Sold=1&LH_Complete=1&_sop=13"
-    )
-    try:
-        time.sleep(random.uniform(1, 3))
-        resp = session.get(search_url, timeout=30)
-        soup = bs4.BeautifulSoup(resp.text, 'html.parser')
-    except Exception as e:
-        print(f"     eBay request failed: {e}")
-        return []
-
-    prices = []
-    for span in soup.find_all('span', attrs={'class': 's-item__price'}):
-        raw = span.text.strip().replace('$', '').replace(',', '')
-        try:
-            if ' to ' in raw:
-                parts = raw.split(' to ')
-                prices.append((float(parts[0]) + float(parts[1])) / 2)
-            else:
-                prices.append(float(raw))
-        except ValueError:
-            pass
-    return prices
-
-
-def _ebay_price_for_grade(title, issue, grade_float, cgc, variant=''):
-    cgc_str = "CGC" if cgc.upper() != 'NO' else ""
-    grade_str = _format_grade(grade_float)
-    query = f"{title} #{issue} {cgc_str} {grade_str} {variant}".strip()
-    prices = _ebay_sold_prices(query)
-    if prices:
-        print(f"     eBay [{grade_str}]: ${prices[0]:.2f}  ({len(prices)} sales found)")
-        return prices[0]
-    return None
-
-
-def GetEbayPrice(title, issue, grade, cgc, variant=''):
-    try:
-        target = float(grade)
-    except ValueError:
-        print(f"     eBay: Cannot parse grade '{grade}'")
-        return None
-
-    price = _ebay_price_for_grade(title, issue, target, cgc, variant)
-    if price is not None:
-        return price
-
-    print(f"     eBay: No sales for grade {grade} – searching nearby grades…")
-    if target not in GRADE_SCALE:
-        print(f"     eBay: Grade {target} not in standard scale.")
-        return None
-
-    idx = GRADE_SCALE.index(target)
-    lower_grade, lower_price = None, None
-    for g in reversed(GRADE_SCALE[:idx]):
-        p = _ebay_price_for_grade(title, issue, g, cgc, variant)
-        if p is not None:
-            lower_grade, lower_price = g, p
-            break
-
-    upper_grade, upper_price = None, None
-    for g in GRADE_SCALE[idx + 1:]:
-        p = _ebay_price_for_grade(title, issue, g, cgc, variant)
-        if p is not None:
-            upper_grade, upper_price = g, p
-            break
-
-    if lower_price is not None and upper_price is not None:
-        ratio = (target - lower_grade) / (upper_grade - lower_grade)
-        interpolated = round(lower_price + ratio * (upper_price - lower_price), 2)
-        print(f"     eBay: Interpolated → ${interpolated:.2f}")
-        return interpolated
-    elif lower_price is not None:
-        return lower_price
-    elif upper_price is not None:
-        return upper_price
-
-    print(f"     eBay: No usable data for {title} #{issue}.")
-    return None
-
-
-# =============================================================================
-#  Main — TEST MODE
+#  Load sheet
 # =============================================================================
 print(f"\n{'='*60}")
-print(f"TEST RUN — first {TEST_LIMIT} records only")
+print(f"TEST RUN — first {TEST_LIMIT} records")
 print(f"{'='*60}\n")
 
-gc = gspread.service_account()
-sh = gc.open(Google_Workbook)
+gc        = gspread.service_account()
+sh        = gc.open(Google_Workbook)
 worksheet = sh.worksheet(Google_Sheet)
-StartingDF = pd.DataFrame(worksheet.get_all_records())
-sortedsheet = StartingDF.sort_values(by=['Title', 'Volume', 'Issue']).copy()
+StartingDF   = pd.DataFrame(worksheet.get_all_records())
+sortedsheet  = StartingDF.sort_values(by=['Title', 'Volume', 'Issue']).copy()
 
 print(f"Loaded {len(sortedsheet)} total records. Processing first {TEST_LIMIT}...\n")
 test_sheet = sortedsheet.head(TEST_LIMIT).copy()
 
+# =============================================================================
+#  Metrics
+# =============================================================================
+stats = {'cv_hit': 0, 'cv_miss': 0, 'ebay_hit': 0, 'ebay_miss': 0, 'errors': 0}
+
+# =============================================================================
+#  Main loop
+# =============================================================================
 for index, thisComic in test_sheet.iterrows():
+    n = list(test_sheet.index).index(index) + 1
     try:
+        # =====================================================================
+        #  READ-ONLY inputs — user's source of truth, never overwritten
+        # =====================================================================
         title   = str(thisComic['Title']).strip().upper()
         issue   = int(str(thisComic['Issue']).strip())
         grade   = str(thisComic['Grade']).strip()
-        cgc     = "No" if thisComic['CGC Graded'] is None else thisComic['CGC Graded']
-        variant = '' if str(thisComic['Variant']).strip() == 'nan' else str(thisComic['Variant']).strip()
-        fullName = title + " #" + str(issue) + variant
+        cgc     = str(thisComic.get('CGC Graded', 'No')).strip()
+        variant = str(thisComic.get('Variant', '')).strip()
+        variant = '' if variant in ('nan', 'None') else variant
 
+        # Book Link: if user pre-populated, use it and don't overwrite
+        existing_book_link = str(thisComic.get('Book Link', '')).strip()
+        existing_book_link = '' if existing_book_link in ('nan', 'None') else existing_book_link
+
+        # Price Paid
         price_paid = 0.0
-        raw_paid = thisComic['Price Paid']
         try:
+            raw_paid = thisComic.get('Price Paid', 0)
             if isinstance(raw_paid, str):
                 price_paid = float(raw_paid.strip().replace('$', '').replace(',', '')) or 0.0
             elif isinstance(raw_paid, (int, float)):
                 price_paid = float(raw_paid)
         except (ValueError, TypeError):
-            print(f'WARNING: Could not parse Price Paid: {raw_paid!r}')
+            print(f'     WARNING: Could not parse Price Paid: {thisComic.get("Price Paid")!r}')
         if price_paid == 0:
             price_paid = 0.01
 
-        test_sheet.at[index, 'Price Paid'] = price_paid
-        print(f"\n[{list(test_sheet.index).index(index)+1}/{TEST_LIMIT}] {fullName}")
+        # =====================================================================
+        #  Enrichment inputs — read for matching context, will be written back
+        # =====================================================================
+        existing_publisher = str(thisComic.get('Publisher', '')).strip()
 
-        # --- Comic Vine ---
-        cv_data = SearchComicVine(title, issue, variant)
+        # Volume column format: "Volume 1", "Vol. 2", or just "1"
+        raw_volume = str(thisComic.get('Volume', '')).strip()
+        vol_match = re.search(r'\d+', raw_volume)
+        volume_number = int(vol_match.group()) if vol_match else None
+
+        fullName = f"{title} #{issue}{variant}"
+        print(f"\n[{n}/{TEST_LIMIT}] {fullName}")
+
+        # =====================================================================
+        #  Comic Vine metadata lookup
+        # =====================================================================
+        cv_data = SearchComicVine(
+            session, CV_API_KEY, title, issue, variant,
+            volume_number=volume_number,
+            publisher=existing_publisher,
+        )
+
         if cv_data:
-            publisher   = cv_data['publisher']
-            volume      = cv_data['volume']
-            published   = cv_data['published']
-            cover_price = cv_data['cover_price']
-            comic_age   = cv_data['comic_age']
-            notes       = cv_data['notes']
-            keyIssue    = cv_data['key_issue']
-            image       = cv_data['cover_image']
-            url_link    = cv_data['book_link']
-            confidence  = cv_data['confidence']
+            stats['cv_hit'] += 1
+            cv_publisher = cv_data['publisher']
+            cv_volume    = cv_data['volume']
+            published    = cv_data['published']
+            cover_price  = cv_data['cover_price']
+            comic_age    = cv_data['comic_age']
+            notes        = cv_data['notes']
+            key_issue    = cv_data['key_issue']
+            cover_image  = cv_data['cover_image']
+            cv_book_link = cv_data['book_link']
+            confidence   = cv_data['confidence']
         else:
-            publisher = volume = published = cover_price = comic_age = ''
-            notes = keyIssue = image = url_link = ''
+            stats['cv_miss'] += 1
+            cv_publisher = cv_volume = published = cover_price = comic_age = ''
+            notes = key_issue = cover_image = cv_book_link = ''
             confidence = None
-            print("     CV lookup failed — values will be blank")
+            print("     CV: no confident match — enrichment fields unchanged")
 
-        # --- eBay ---
-        if len(grade) < 3:
-            grade = grade + ".0"
+        # =====================================================================
+        #  eBay pricing: graded, ungraded, and current-state value
+        # =====================================================================
+        grade_norm = normalise_grade(grade)
 
-        value = GetEbayPrice(title, issue, grade, cgc, variant)
-        if value is None:
+        graded_price   = GetEbayPriceGraded(session, title, issue, grade_norm or grade, variant)
+        ungraded_price = GetEbayPriceUngraded(session, title, issue, grade_norm or grade, variant)
+
+        is_cgc = cgc.upper() not in ('NO', 'N', 'FALSE', '', 'NAN', 'NONE')
+        if is_cgc and graded_price is not None:
+            current_value = graded_price
+        elif ungraded_price is not None:
+            current_value = ungraded_price
+        else:
+            current_value = None
+
+        if current_value is not None:
+            stats['ebay_hit'] += 1
+        else:
+            stats['ebay_miss'] += 1
             try:
-                value = float(str(thisComic.get('Value', '0')).replace('$', '').replace(',', '')) or 0.0
+                current_value = float(
+                    str(thisComic.get('Value', '0')).replace('$', '').replace(',', '')
+                ) or 0.0
             except (ValueError, TypeError):
-                value = 0.0
-            print(f"     eBay unavailable — keeping existing: ${value:.2f}")
+                current_value = 0.0
+            print(f"     eBay: no sales — keeping existing value: ${current_value:.2f}")
 
-        test_sheet.at[index, 'Publisher']   = publisher
-        test_sheet.at[index, 'Volume']      = volume
-        test_sheet.at[index, 'Published']   = published
-        test_sheet.at[index, 'KeyIssue']    = keyIssue
-        test_sheet.at[index, 'Cover Price'] = cover_price
-        test_sheet.at[index, 'Comic Age']   = comic_age
-        test_sheet.at[index, 'Notes']       = notes
-        test_sheet.at[index, 'Confidence']  = confidence
-        test_sheet.at[index, 'Book Link']   = url_link
-        test_sheet.at[index, 'Cover Image'] = image
-        test_sheet.at[index, rundate]       = value
+        graded_gain = round((graded_price or 0.0) - price_paid, 2)
 
-        print(f"     ✓ Publisher: {publisher or 'N/A'} | Age: {comic_age} | Value: ${value:.2f}")
+        # =====================================================================
+        #  Write enrichment fields back
+        #  Rules:
+        #    - Title, Issue, Grade, CGC Graded, Variant, Price Paid: NEVER touched
+        #    - Publisher, Volume: written only if CV found them
+        #    - Book Link: written only if user left it blank
+        #    - All other enrichment fields: written if CV matched
+        # =====================================================================
+        if cv_data:
+            test_sheet.at[index, 'Publisher']   = cv_publisher
+            test_sheet.at[index, 'Volume']      = cv_volume
+            test_sheet.at[index, 'Published']   = published
+            test_sheet.at[index, 'KeyIssue']    = key_issue
+            test_sheet.at[index, 'Cover Price'] = cover_price
+            test_sheet.at[index, 'Comic Age']   = comic_age
+            test_sheet.at[index, 'Notes']       = notes
+            test_sheet.at[index, 'Confidence']  = round(confidence, 4)
+            test_sheet.at[index, 'Cover Image'] = cover_image
+            if not existing_book_link:
+                test_sheet.at[index, 'Book Link'] = cv_book_link
+
+        test_sheet.at[index, 'Price Paid']   = price_paid
+        test_sheet.at[index, 'Graded']       = graded_price   if graded_price   is not None else ''
+        test_sheet.at[index, 'Ungraded']     = ungraded_price if ungraded_price is not None else ''
+        test_sheet.at[index, 'Graded Gain']  = graded_gain
+        test_sheet.at[index, 'Value']        = current_value
+        test_sheet.at[index, rundate]        = current_value
+
+        cv_tag   = f"CV ✓ ({int(confidence*100)}%)" if cv_data else "CV ✗"
+        ebay_tag = f"eBay ✓ ${current_value:.2f}" if stats['ebay_hit'] > stats['ebay_miss'] else f"eBay ✗ (kept ${current_value:.2f})"
+        print(f"     {cv_tag} | {ebay_tag} | {comic_age or 'Age unknown'}")
 
     except Exception as e:
+        stats['errors'] += 1
         print(f"     ERROR: {e}")
+        import traceback; traceback.print_exc()
         continue
 
-# Write the 10 updated rows back
+# =============================================================================
+#  Write results back to Google Sheet
+# =============================================================================
 print(f"\n{'='*60}")
 print("Writing results back to Google Sheet...")
 
@@ -352,9 +213,21 @@ for index, row in test_sheet.iterrows():
     for col in test_sheet.columns:
         sortedsheet.at[index, col] = row[col]
 
-sortedsheet.fillna('', inplace=True)
+safe_fillna(sortedsheet)
 worksheet.update([sortedsheet.columns.values.tolist()] + sortedsheet.values.tolist())
-
 print("✓ Google Sheet updated.")
+
+# =============================================================================
+#  Results summary
+# =============================================================================
+total     = TEST_LIMIT
+cv_rate   = stats['cv_hit']   / total * 100
+ebay_rate = stats['ebay_hit'] / total * 100
+
+print(f"\n{'='*60}")
+print(f"RESULTS ({total} records)")
+print(f"  Comic Vine hits : {stats['cv_hit']:>3}/{total}  ({cv_rate:.0f}%)")
+print(f"  eBay hits       : {stats['ebay_hit']:>3}/{total}  ({ebay_rate:.0f}%)")
+print(f"  Errors          : {stats['errors']:>3}")
 print(f"{'='*60}")
 print("TEST RUN COMPLETE")
