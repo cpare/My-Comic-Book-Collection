@@ -170,12 +170,12 @@ def SearchComicVine(session, cv_api_key, title, issue, variant='',
     Search strategy:
       NOTE: The /issues filter endpoint (volume.name + issue_number) was found to be
       unreliable — CV's API ignores the volume.name param and returns tens of thousands
-      of unrelated results sorted by internal ID. The /search endpoint is significantly
-      more accurate and is now used exclusively.
+      of unrelated results sorted by internal ID.
 
-      1. /search endpoint with "title #issue" query
-      2. Scoring penalises issue number mismatches and rewards publisher/volume matches
-      3. Reject if best confidence < CV_CONFIDENCE_THRESHOLD
+      1. /search for the issue directly ("title #issue")
+      2. If confidence < threshold: /search for the volume by name + publisher, then
+         fetch its issues and match by issue number exactly
+      3. Reject if best confidence < CV_CONFIDENCE_THRESHOLD after both strategies
 
     IMPORTANT: This function only returns *enrichment* metadata.
     The caller must never overwrite Title, Issue, Volume, or Publisher
@@ -191,7 +191,7 @@ def SearchComicVine(session, cv_api_key, title, issue, variant='',
         'site_detail_url,character_credits'
     )
 
-    # --- /search endpoint (only strategy — filter endpoint is broken for volume.name) ---
+    # --- Strategy 1: /search for the issue directly ---
     print(f"     CV: Searching for '{full_name}'")
     search_results = _cv_get(session, cv_api_key, 'search', {
         'query': f"{title} #{issue}",
@@ -206,6 +206,51 @@ def SearchComicVine(session, cv_api_key, title, issue, variant='',
         volume_number=volume_number,
         publisher=publisher,
     )
+
+    # --- Strategy 2: volume lookup fallback ---
+    # Used when the title is ambiguous (short, numeric, year-like) and /search
+    # can't surface the right series. Find the volume by name, then fetch its issues.
+    if best_score < CV_CONFIDENCE_THRESHOLD:
+        print(f"     CV: Issue search low ({int(best_score*100)}%) — trying volume lookup fallback")
+        vol_query = f"{title} {publisher}".strip() if publisher else title
+        vol_results = _cv_get(session, cv_api_key, 'search', {
+            'query': vol_query,
+            'resources': 'volume',
+            'field_list': 'id,name,publisher,start_year,count_of_issues',
+            'limit': 10,
+        })
+        volumes = [r for r in (vol_results or []) if r.get('resource_type') == 'volume']
+
+        # Score volumes by name similarity + optional publisher match
+        best_vol, best_vol_score = None, 0.0
+        for v in volumes:
+            vscore = similar(v.get('name', '').upper(), title.upper())
+            if publisher:
+                vpub = (v.get('publisher') or {}).get('name', '').upper()
+                if vpub and publisher.upper() in vpub:
+                    vscore += 0.2
+            vscore = min(1.0, vscore)
+            if vscore > best_vol_score:
+                best_vol_score = vscore
+                best_vol = v
+
+        if best_vol and best_vol_score >= 0.7:
+            vol_id = best_vol.get('id')
+            print(f"     CV: Volume match '{best_vol.get('name')}' (id={vol_id}, {int(best_vol_score*100)}%) — fetching issues")
+            vol_issues = _cv_get(session, cv_api_key, 'issues', {
+                'filter': f'volume:{vol_id},issue_number:{issue}',
+                'field_list': field_list,
+                'limit': 10,
+            })
+            if vol_issues:
+                vb, vs = _pick_best_match(
+                    vol_issues, full_name,
+                    issue_number=issue,
+                    volume_number=volume_number,
+                    publisher=publisher,
+                )
+                if vs > best_score:
+                    best, best_score = vb, vs
 
     if best is None or best_score < CV_CONFIDENCE_THRESHOLD:
         print(f"     CV: No confident match for '{full_name}' "
