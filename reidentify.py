@@ -84,7 +84,7 @@ failed  = 0
 
 COOLDOWN_EVERY  = 100  # pause every N comics to let CV rate limit recover
 COOLDOWN_SECS   = 60   # seconds to pause
-CHECKPOINT_EVERY = 50  # flush changes to Google Sheets every N fixed rows
+CHECKPOINT_EVERY = 250  # flush changes to Google Sheets every N fixed rows
 
 # Columns we update on each identified row
 UPDATE_COLS = [
