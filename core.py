@@ -168,10 +168,14 @@ def SearchComicVine(session, cv_api_key, title, issue, variant='',
       publisher     — sheet Publisher field (str); used to break ties
 
     Search strategy:
-      1. Filter by volume.name + issue_number (most precise)
-      2. If no results or low confidence: /search endpoint (handles unusual titles)
-      3. Scoring penalises issue number mismatches and rewards publisher/volume matches
-      4. Reject if best confidence < CV_CONFIDENCE_THRESHOLD
+      NOTE: The /issues filter endpoint (volume.name + issue_number) was found to be
+      unreliable — CV's API ignores the volume.name param and returns tens of thousands
+      of unrelated results sorted by internal ID. The /search endpoint is significantly
+      more accurate and is now used exclusively.
+
+      1. /search endpoint with "title #issue" query
+      2. Scoring penalises issue number mismatches and rewards publisher/volume matches
+      3. Reject if best confidence < CV_CONFIDENCE_THRESHOLD
 
     IMPORTANT: This function only returns *enrichment* metadata.
     The caller must never overwrite Title, Issue, Volume, or Publisher
@@ -187,38 +191,21 @@ def SearchComicVine(session, cv_api_key, title, issue, variant='',
         'site_detail_url,character_credits'
     )
 
-    # --- Strategy 1: volume.name + issue_number filter ---
-    results = _cv_get(session, cv_api_key, 'issues', {
-        'filter': f'volume.name:{title},issue_number:{issue}',
+    # --- /search endpoint (only strategy — filter endpoint is broken for volume.name) ---
+    print(f"     CV: Searching for '{full_name}'")
+    search_results = _cv_get(session, cv_api_key, 'search', {
+        'query': f"{title} #{issue}",
+        'resources': 'issue',
         'field_list': field_list,
         'limit': 20,
     })
+    issues = [r for r in (search_results or []) if r.get('resource_type') == 'issue']
     best, best_score = _pick_best_match(
-        results or [], full_name,
+        issues, full_name,
         issue_number=issue,
         volume_number=volume_number,
         publisher=publisher,
     )
-
-    # --- Strategy 2: /search fallback if confidence too low ---
-    if best_score < CV_CONFIDENCE_THRESHOLD:
-        print(f"     CV: Filter match low ({int(best_score*100)}%) — trying /search fallback")
-        search_results = _cv_get(session, cv_api_key, 'search', {
-            'query': f"{title} #{issue}",
-            'resources': 'issue',
-            'field_list': field_list,
-            'limit': 20,
-        })
-        if search_results:
-            issues = [r for r in search_results if r.get('resource_type') == 'issue']
-            sb, ss = _pick_best_match(
-                issues, full_name,
-                issue_number=issue,
-                volume_number=volume_number,
-                publisher=publisher,
-            )
-            if ss > best_score:
-                best, best_score = sb, ss
 
     if best is None or best_score < CV_CONFIDENCE_THRESHOLD:
         print(f"     CV: No confident match for '{full_name}' "
