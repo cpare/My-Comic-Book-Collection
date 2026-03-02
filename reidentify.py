@@ -24,6 +24,7 @@ import pandas as pd
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 sys.path.insert(0, os.path.dirname(__file__))
 
+import time
 from core import SearchComicVine, safe_fillna, rundate, ID_DATE_COL
 
 # ---------------------------------------------------------------------------
@@ -36,15 +37,28 @@ group.add_argument('--all',   action='store_true',   help='Re-identify all comic
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
-#  Connect
+#  Connect (with retry on transient Google API errors)
 # ---------------------------------------------------------------------------
 Google_Workbook = os.getenv('GOOGLE_WORKBOOK')
 Google_Sheet    = os.getenv('GOOGLE_SHEET')
 CV_API_KEY      = os.getenv('CV_API_KEY')
 
-gc        = gspread.service_account()
-sh        = gc.open(Google_Workbook)
-worksheet = sh.worksheet(Google_Sheet)
+def _gsheet_connect(workbook, sheet, retries=3):
+    for attempt in range(retries):
+        try:
+            gc        = gspread.service_account()
+            sh        = gc.open(workbook)
+            worksheet = sh.worksheet(sheet)
+            return gc, sh, worksheet
+        except Exception as e:
+            if attempt < retries - 1:
+                wait = 10 * (attempt + 1)
+                print(f"Google Sheets error (attempt {attempt+1}): {e} — retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
+
+gc, sh, worksheet = _gsheet_connect(Google_Workbook, Google_Sheet)
 
 df = pd.DataFrame(worksheet.get_all_records())
 if ID_DATE_COL not in df.columns:

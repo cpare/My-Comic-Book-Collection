@@ -22,81 +22,22 @@ rundate = date.today().strftime("%Y-%m-%d")
 GOOGLE_WORKBOOK = os.getenv('GOOGLE_WORKBOOK', 'Comics')
 GOOGLE_SHEET    = os.getenv('GOOGLE_SHEET', 'Real')
 
-
-def safe_str(val, default=''):
-    s = str(val).strip()
-    return default if s.lower() == 'nan' or s.lower() == 'none' else s
-
-
-def safe_float(val):
-    try:
-        v = str(val).replace('$', '').replace(',', '').strip()
-        return float(v) if v else 0.0
-    except (ValueError, TypeError):
-        return 0.0
-
-
-def generate_html_page(sortedsheet, outfile='comics.html'):
-    html_body = ''
-    for _, comic in sortedsheet.iterrows():
-        title     = safe_str(comic.get('Title', ''), '').upper()
-        notes     = safe_str(comic.get('Notes', ''))
-        published = safe_str(comic.get('Published', ''))
-        issue_raw = safe_str(comic.get('Issue', '0'), '0')
-        try:
-            issue = int(float(issue_raw))
-        except (ValueError, TypeError):
-            issue = 0
-        value     = safe_float(comic.get('Value', 0))
-        image     = safe_str(comic.get('Cover Image', ''), '').upper()
-        grade     = safe_str(comic.get('Grade', ''))
-        cgc       = safe_str(comic.get('CGC Graded', 'No'), 'No')
-        key       = safe_str(comic.get('KeyIssue', 'No'), 'No')
-        variant   = safe_str(comic.get('Variant', ''))
-        url       = safe_str(comic.get('Book Link', ''))
-
-        cgc_div = '' if cgc.upper() in ('NO', 'N', 'FALSE', '', 'NAN', 'NONE') else "<div class='cgc'>CGC</div>"
-        key_div = '' if key.upper()  in ('NO', 'N', 'FALSE', '', 'NAN', 'NONE') else "<div class='key'>KEY</div>"
-
-        published_div = f"<div class='published'>{published}</div>"
-        title_div     = f"<div class='title'><a href='{url}'>{title} #{issue}{variant}</a></div>"
-        notes_div     = f"<div class='notes'>{notes}</div>"
-        grade_div     = f"<div class='grade'>Grade: {grade}</div>"
-        try:
-            value_str = locale.currency(value, grouping=True)
-        except Exception:
-            value_str = f'${value:.2f}'
-        value_div = f"<div class='value'>{value_str}</div>"
-
-        html_body += f"<div class='hvrbox'><img src='{image}' alt='Cover' class='hvrbox-layer_bottom'>\n"
-        html_body += "\t<div class='hvrbox-layer_top'>\n"
-        html_body += "\t\t<div class='hvrbox-text'>\n"
-        html_body += f"\t\t\t{title_div}\n"
-        html_body += f"\t\t\t{published_div}\n"
-        html_body += f"\t\t\t{notes_div}\n"
-        html_body += f"\t\t\t{grade_div}\n"
-        html_body += f"\t\t\t{value_div}\n"
-        html_body += f"\t\t\t{cgc_div}\n"
-        html_body += f"\t\t\t{key_div}\n"
-        html_body += "\t\t</div>\n"
-        html_body += "\t</div>\n"
-        html_body += "</div>\n"
-
-    css = """
-<html>
+HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <title>Comic Book Collection</title>
-<style type="text/css">
-body {
+<style>
+body {{
     color: whitesmoke;
     background-color: #282828;
     font-family: Arial, Helvetica, sans-serif;
     margin: 0;
     padding: 10px;
-}
-a { color: whitesmoke; text-decoration: none; }
-.cgc {
+}}
+a {{ color: whitesmoke; text-decoration: none; }}
+.cgc {{
     background-color: rgb(148, 7, 35);
     z-index: 5;
     position: absolute;
@@ -105,8 +46,8 @@ a { color: whitesmoke; text-decoration: none; }
     padding: 2px 6px;
     font-size: 12px;
     font-weight: bold;
-}
-.key {
+}}
+.key {{
     background-color: rgb(212, 175, 55);
     z-index: 5;
     position: absolute;
@@ -116,17 +57,17 @@ a { color: whitesmoke; text-decoration: none; }
     font-size: 12px;
     font-weight: bold;
     color: #222;
-}
-.title {
+}}
+.title {{
     position: relative;
     font-size: large;
     font-weight: bold;
     width: 210px;
     margin: 0 auto;
     margin-top: 8px;
-}
-.published { color: lightgray; font-size: 13px; margin-top: 4px; }
-.notes {
+}}
+.published {{ color: lightgray; font-size: 13px; margin-top: 4px; }}
+.notes {{
     position: absolute;
     top: 0;
     font-size: 14px;
@@ -137,25 +78,25 @@ a { color: whitesmoke; text-decoration: none; }
     height: 400px;
     width: 210px;
     padding: 10px;
-}
-.grade {
+}}
+.grade {{
     position: absolute;
     bottom: 50px;
     left: 0;
     font-size: 18px;
     width: 250px;
     text-align: center;
-}
-.value {
+}}
+.value {{
     position: absolute;
     bottom: 10px;
     left: 0;
     font-size: x-large;
     width: 250px;
     text-align: center;
-}
-.hvrbox, .hvrbox * { box-sizing: border-box; padding: 0; }
-.hvrbox {
+}}
+.hvrbox, .hvrbox * {{ box-sizing: border-box; padding: 0; }}
+.hvrbox {{
     position: relative;
     display: inline-block;
     overflow: hidden;
@@ -163,36 +104,113 @@ a { color: whitesmoke; text-decoration: none; }
     height: 400px;
     margin: 4px;
     vertical-align: top;
-}
-.hvrbox img { width: 250px; height: 400px; object-fit: cover; }
-.hvrbox .hvrbox-layer_bottom { display: block; }
-.hvrbox .hvrbox-layer_top {
+}}
+.hvrbox img {{ width: 250px; height: 400px; object-fit: cover; }}
+.hvrbox .hvrbox-layer_bottom {{ display: block; }}
+.hvrbox .hvrbox-layer_top {{
     opacity: 0;
     position: absolute;
     top: 0; left: 0; right: 0; bottom: 0;
     background: rgba(0, 0, 0, 0.82);
     padding: 0;
-    transition: all 0.3s ease-in-out 0s;
-}
+    transition: opacity 0.3s ease-in-out;
+}}
 .hvrbox:hover .hvrbox-layer_top,
-.hvrbox.active .hvrbox-layer_top { opacity: 1; }
-.hvrbox .hvrbox-text {
+.hvrbox.active .hvrbox-layer_top {{ opacity: 1; }}
+.hvrbox .hvrbox-text {{
     text-align: center;
     font-size: 15px;
-    display: inline-block;
-    padding: 10px 15px;
     position: absolute;
     top: 0; left: 0; right: 0; bottom: 0;
-}
+    padding: 10px 15px;
+}}
 </style>
 </head>
 <body>
+{body}
+</body>
+</html>
 """
 
+
+def safe_str(val, default=''):
+    """Return string value, substituting default for nan/None/empty."""
+    s = str(val).strip()
+    return default if s.lower() in ('nan', 'none', '') else s
+
+
+def safe_float(val):
+    """Parse a currency/numeric string to float, returning 0.0 on failure."""
+    try:
+        v = str(val).replace('$', '').replace(',', '').strip()
+        return float(v) if v else 0.0
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _flag(val):
+    """Return True if value represents a truthy yes/cgc/key flag."""
+    return str(val).strip().upper() not in ('NO', 'N', 'FALSE', '', 'NAN', 'NONE', '0')
+
+
+def _issue_label(issue_raw, variant):
+    """
+    Build the display issue string, preserving letter suffixes (e.g. '500B', '275B').
+    Falls back to raw string if it can't be parsed as int.
+    """
+    s = safe_str(issue_raw, '0')
+    # Try pure int first
+    try:
+        return str(int(float(s))) + safe_str(variant)
+    except (ValueError, TypeError):
+        pass
+    # Has a letter suffix like '500B' — keep as-is
+    return s + safe_str(variant)
+
+
+def generate_html_page(sortedsheet, outfile='comics.html'):
+    """Render sorted DataFrame to a hover-card HTML gallery."""
+    cards = []
+    for _, comic in sortedsheet.iterrows():
+        title     = safe_str(comic.get('Title', ''), 'Unknown').upper()
+        notes     = safe_str(comic.get('Notes', ''))
+        published = safe_str(comic.get('Published', ''))
+        issue_lbl = _issue_label(comic.get('Issue', '0'), comic.get('Variant', ''))
+        value     = safe_float(comic.get('Value', 0))
+        image     = safe_str(comic.get('Cover Image', ''))   # NOT uppercased — it's a URL
+        grade     = safe_str(comic.get('Grade', ''))
+        url       = safe_str(comic.get('Book Link', ''))
+        cgc       = _flag(comic.get('CGC Graded', 'No'))
+        key       = _flag(comic.get('KeyIssue', 'No'))
+
+        try:
+            value_str = locale.currency(value, grouping=True)
+        except Exception:
+            value_str = f'${value:.2f}'
+
+        cgc_badge = "<div class='cgc'>CGC</div>" if cgc else ''
+        key_badge = "<div class='key'>KEY</div>" if key else ''
+
+        card = (
+            f"<div class='hvrbox'>"
+            f"<img src='{image}' alt='{title} #{issue_lbl}' class='hvrbox-layer_bottom'>\n"
+            f"\t<div class='hvrbox-layer_top'>\n"
+            f"\t\t<div class='hvrbox-text'>\n"
+            f"\t\t\t<div class='title'><a href='{url}'>{title} #{issue_lbl}</a></div>\n"
+            f"\t\t\t<div class='published'>{published}</div>\n"
+            f"\t\t\t<div class='notes'>{notes}</div>\n"
+            f"\t\t\t<div class='grade'>Grade: {grade}</div>\n"
+            f"\t\t\t<div class='value'>{value_str}</div>\n"
+            f"\t\t\t{cgc_badge}\n"
+            f"\t\t\t{key_badge}\n"
+            f"\t\t</div>\n"
+            f"\t</div>\n"
+            f"</div>\n"
+        )
+        cards.append(card)
+
     with open(outfile, 'w', encoding='utf-8') as f:
-        f.write(css)
-        f.write(html_body)
-        f.write("\n</body></html>\n")
+        f.write(HTML_TEMPLATE.format(body='\n'.join(cards)))
 
     print(f"Generated {outfile} ({len(sortedsheet)} comics)")
 
@@ -207,8 +225,13 @@ def read_google_sheet(workbook, sheet):
 
 
 def backup_sheet(sh, df, label=None):
+    """Create a backup worksheet. Skips if one with this label already exists."""
     label = label or rundate
     title = f"Backup {label}"
+    existing = [w.title for w in sh.worksheets()]
+    if title in existing:
+        print(f"Backup '{title}' already exists — skipping")
+        return None
     rows = df.shape[0] + 2
     cols = df.shape[1]
     backup_ws = sh.add_worksheet(title=title, rows=rows, cols=cols)
@@ -222,7 +245,7 @@ if __name__ == '__main__':
     df, sorted_df, worksheet, sh = read_google_sheet(GOOGLE_WORKBOOK, GOOGLE_SHEET)
     print(f"  {len(df)} comics loaded")
 
-    print("Creating backup...")
+    print("Checking backup...")
     backup_sheet(sh, df)
 
     print("Generating HTML report...")
