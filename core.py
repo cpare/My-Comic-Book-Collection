@@ -14,6 +14,7 @@ import bs4
 from difflib import SequenceMatcher
 from datetime import date
 import os
+import time
 
 rundate = date.today().strftime("%Y-%m-%d")
 ID_DATE_COL = 'Identification Date'  # Column name for CV identification tracking
@@ -24,6 +25,8 @@ EBAY_FINDING_PROD    = "https://svcs.ebay.com/services/search/FindingService/v1"
 EBAY_FINDING_SANDBOX = "https://svcs.sandbox.ebay.com/services/search/FindingService/v1"
 CV_HEADERS = {"User-Agent": "MyComicCollection/1.0"}
 CV_CONFIDENCE_THRESHOLD = 0.60   # Reject matches below this — prevents wrong-title pollution
+CV_REQUEST_DELAY        = 0.5    # Seconds to sleep between every CV API call (avoids 420s)
+CV_RETRY_DELAYS         = [5, 15, 30]  # Backoff delays (seconds) on HTTP 420 rate-limit
 
 GRADE_SCALE = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5,
                5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0,
@@ -101,21 +104,34 @@ def safe_fillna(df):
 # =============================================================================
 
 def _cv_get(session, cv_api_key, endpoint, params):
-    """Make a Comic Vine API call. Returns parsed results or None."""
+    """Make a Comic Vine API call with rate-limit retry. Returns parsed results or None."""
     params.update({'api_key': cv_api_key, 'format': 'json'})
     url = f"{CV_BASE}/{endpoint}/"
-    try:
-        resp = session.get(url, params=params, headers=CV_HEADERS, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get('status_code') == 1:
-            return data.get('results')
-        else:
-            print(f"     CV API error: {data.get('error')} (code {data.get('status_code')})")
+    time.sleep(CV_REQUEST_DELAY)  # polite inter-request delay
+    for attempt, backoff in enumerate([0] + CV_RETRY_DELAYS):
+        if backoff:
+            print(f"     CV rate-limited — waiting {backoff}s before retry {attempt}...")
+            time.sleep(backoff)
+        try:
+            resp = session.get(url, params=params, headers=CV_HEADERS, timeout=30)
+            if resp.status_code == 420:
+                if attempt < len(CV_RETRY_DELAYS):
+                    continue  # retry with next backoff
+                print(f"     CV request failed: HTTP Error 420 (rate limit, retries exhausted)")
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get('status_code') == 1:
+                return data.get('results')
+            else:
+                print(f"     CV API error: {data.get('error')} (code {data.get('status_code')})")
+                return None
+        except Exception as e:
+            if '420' in str(e) and attempt < len(CV_RETRY_DELAYS):
+                continue
+            print(f"     CV request failed: {e}")
             return None
-    except Exception as e:
-        print(f"     CV request failed: {e}")
-        return None
+    return None
 
 
 def _pick_best_match(results, full_name, issue_number=None, volume_number=None, publisher=None):
