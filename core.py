@@ -13,12 +13,15 @@ from curl_cffi import requests
 import bs4
 from difflib import SequenceMatcher
 from datetime import date
-from urllib.parse import quote_plus
+import os
 
 rundate = date.today().strftime("%Y-%m-%d")
 ID_DATE_COL = 'Identification Date'  # Column name for CV identification tracking
 
-CV_BASE = "https://comicvine.gamespot.com/api"
+CV_BASE  = "https://comicvine.gamespot.com/api"
+
+EBAY_FINDING_PROD    = "https://svcs.ebay.com/services/search/FindingService/v1"
+EBAY_FINDING_SANDBOX = "https://svcs.sandbox.ebay.com/services/search/FindingService/v1"
 CV_HEADERS = {"User-Agent": "MyComicCollection/1.0"}
 CV_CONFIDENCE_THRESHOLD = 0.60   # Reject matches below this — prevents wrong-title pollution
 
@@ -274,31 +277,66 @@ def SearchComicVine(session, cv_api_key, title, issue, variant='',
 # =============================================================================
 
 def _ebay_sold_prices(session, query):
-    """Fetch eBay sold listing prices for a query string."""
-    search_url = (
-        "https://www.ebay.com/sch/i.html?"
-        f"_nkw={quote_plus(query)}"
-        "&LH_Sold=1&LH_Complete=1&_sop=13"
-    )
-    try:
-        resp = session.get(search_url, timeout=30)
-        soup = bs4.BeautifulSoup(resp.text, 'html.parser')
-    except Exception as e:
-        print(f"     eBay request failed: {e}")
+    """
+    Fetch eBay sold listing prices via the Finding API (findCompletedItems).
+
+    Requires EBAY_APP_ID in environment. Set EBAY_SANDBOX=true to hit the
+    sandbox endpoint (test data only — switch to production keys for real prices).
+    """
+    app_id = os.getenv('EBAY_APP_ID', '')
+    if not app_id:
+        print("     eBay: EBAY_APP_ID not set — skipping eBay lookup")
         return []
 
-    prices = []
-    for span in soup.find_all('span', attrs={'class': 's-item__price'}):
-        raw = span.text.strip().replace('$', '').replace(',', '')
-        try:
-            if ' to ' in raw:
-                parts = raw.split(' to ')
-                prices.append((float(parts[0]) + float(parts[1])) / 2)
-            else:
-                prices.append(float(raw))
-        except ValueError:
-            pass
-    return prices
+    sandbox = os.getenv('EBAY_SANDBOX', 'false').lower() in ('1', 'true', 'yes')
+    endpoint = EBAY_FINDING_SANDBOX if sandbox else EBAY_FINDING_PROD
+
+    params = {
+        'OPERATION-NAME':           'findCompletedItems',
+        'SERVICE-VERSION':          '1.0.0',
+        'SECURITY-APPNAME':         app_id,
+        'RESPONSE-DATA-FORMAT':     'JSON',
+        'REST-PAYLOAD':             '',
+        'keywords':                 query,
+        'itemFilter(0).name':       'SoldItemsOnly',
+        'itemFilter(0).value':      'true',
+        'sortOrder':                'EndTimeSoonest',
+        'paginationInput.entriesPerPage': '10',
+    }
+
+    try:
+        resp = session.get(endpoint, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        response_root = data.get('findCompletedItemsResponse', [{}])[0]
+        ack = response_root.get('ack', [''])[0]
+        if ack != 'Success':
+            error_msg = (response_root
+                         .get('errorMessage', [{}])[0]
+                         .get('error', [{}])[0]
+                         .get('message', ['Unknown error'])[0])
+            print(f"     eBay API error: {error_msg}")
+            return []
+
+        items = (response_root
+                 .get('searchResult', [{}])[0]
+                 .get('item', []))
+
+        prices = []
+        for item in items:
+            selling    = item.get('sellingStatus', [{}])[0]
+            price_data = selling.get('convertedCurrentPrice', [{}])[0]
+            try:
+                prices.append(float(price_data.get('__value__', 0)))
+            except (ValueError, TypeError):
+                pass
+
+        return prices
+
+    except Exception as e:
+        print(f"     eBay API request failed: {e}")
+        return []
 
 
 def _ebay_price_for_grade(session, title, issue, grade_float, cgc, variant=''):
