@@ -212,24 +212,40 @@ def SearchComicVine(session, cv_api_key, title, issue, variant='',
     # can't surface the right series. Find the volume by name, then fetch its issues.
     if best_score < CV_CONFIDENCE_THRESHOLD:
         print(f"     CV: Issue search low ({int(best_score*100)}%) — trying volume lookup fallback")
-        vol_query = f"{title} {publisher}".strip() if publisher else title
+        # Use title only (not title+publisher) — adding publisher name degrades CV search results
         vol_results = _cv_get(session, cv_api_key, 'search', {
-            'query': vol_query,
+            'query': title,
             'resources': 'volume',
             'field_list': 'id,name,publisher,start_year,count_of_issues',
             'limit': 10,
         })
         volumes = [r for r in (vol_results or []) if r.get('resource_type') == 'volume']
 
-        # Score volumes by name similarity + optional publisher match
+        # Score volumes by name similarity + publisher match + issue range plausibility
         best_vol, best_vol_score = None, 0.0
+        try:
+            issue_int = int(str(issue).strip())
+        except (ValueError, TypeError):
+            issue_int = None
+
         for v in volumes:
             vscore = similar(v.get('name', '').upper(), title.upper())
             if publisher:
                 vpub = (v.get('publisher') or {}).get('name', '').upper()
                 if vpub and publisher.upper() in vpub:
                     vscore += 0.2
-            vscore = min(1.0, vscore)
+            # Bonus: volume has enough issues to contain the one we want
+            if issue_int is not None:
+                count = v.get('count_of_issues') or 0
+                try:
+                    count = int(count)
+                except (ValueError, TypeError):
+                    count = 0
+                if count >= issue_int:
+                    vscore += 0.15
+                elif count > 0 and count < issue_int:
+                    vscore -= 0.3   # volume too short to contain this issue
+            vscore = min(1.0, max(0.0, vscore))
             if vscore > best_vol_score:
                 best_vol_score = vscore
                 best_vol = v
