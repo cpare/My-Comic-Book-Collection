@@ -64,6 +64,10 @@ df = pd.DataFrame(worksheet.get_all_records())
 if ID_DATE_COL not in df.columns:
     df[ID_DATE_COL] = ''
 
+# Build column-name → sheet column index map (1-based)
+headers = worksheet.row_values(1)
+col_index = {name: i+1 for i, name in enumerate(headers)}
+
 sorted_df = df.sort_values(by=['Title', 'Volume', 'Issue'])
 
 limit = len(sorted_df) if args.all else args.limit
@@ -78,8 +82,45 @@ fixed   = 0
 skipped = 0
 failed  = 0
 
-COOLDOWN_EVERY = 100   # pause every N comics to let CV rate limit recover
-COOLDOWN_SECS  = 60    # seconds to pause
+COOLDOWN_EVERY  = 100  # pause every N comics to let CV rate limit recover
+COOLDOWN_SECS   = 60   # seconds to pause
+CHECKPOINT_EVERY = 50  # flush changes to Google Sheets every N fixed rows
+
+# Columns we update on each identified row
+UPDATE_COLS = [
+    'Publisher', 'Published', 'KeyIssue', 'Cover Price',
+    'Comic Age', 'Notes', 'Confidence', 'Cover Image',
+    'Book Link', ID_DATE_COL,
+]
+
+# Track pending row updates: sheet_row (1-based) → list of (col_index, value)
+pending = {}  # sheet_row -> {col: value}
+
+def _sheet_row(df_index):
+    """Convert DataFrame index to 1-based Google Sheet row (header is row 1)."""
+    # sorted_df positions map back to original df positions; sheet row = original df index + 2
+    return df_index + 2
+
+def flush_pending(pending, worksheet, label=''):
+    """Write all pending updates to the sheet in one batch call per row."""
+    if not pending:
+        return
+    # Build a list of Cell objects for batch update
+    cells = []
+    for sheet_row, col_vals in pending.items():
+        for col_idx, value in col_vals.items():
+            cells.append(gspread.Cell(sheet_row, col_idx, value))
+    for attempt in range(3):
+        try:
+            worksheet.update_cells(cells, value_input_option='USER_ENTERED')
+            print(f"  ✓ Checkpoint{' '+label if label else ''}: {len(pending)} rows written to sheet")
+            pending.clear()
+            return
+        except Exception as e:
+            wait = 10 * (attempt + 1)
+            print(f"  Sheet write error (attempt {attempt+1}): {e} — retrying in {wait}s...")
+            time.sleep(wait)
+    print("  ✗ Checkpoint write failed after 3 attempts — will retry at next checkpoint")
 
 for index, thisComic in target.iterrows():
     processed = fixed + skipped + failed
@@ -138,28 +179,42 @@ for index, thisComic in target.iterrows():
     if str(old_date) != str(new_date):
         print(f"     Published: '{old_date}' → '{new_date}'")
 
-    # Write corrections
-    sorted_df.at[index, 'Publisher']   = cv_data['publisher']
-    sorted_df.at[index, 'Published']   = cv_data['published']
-    sorted_df.at[index, 'KeyIssue']    = cv_data['key_issue']
-    sorted_df.at[index, 'Cover Price'] = cv_data['cover_price']
-    sorted_df.at[index, 'Comic Age']   = cv_data['comic_age']
-    sorted_df.at[index, 'Notes']       = cv_data['notes']
-    sorted_df.at[index, 'Confidence']  = round(cv_data['confidence'], 4)
-    sorted_df.at[index, 'Cover Image'] = cv_data['cover_image']
-    sorted_df.at[index, ID_DATE_COL]   = rundate
-    # Always update Book Link on a re-run (we're here to fix bad links)
-    sorted_df.at[index, 'Book Link']   = cv_data['book_link']
+    # Stage corrections in DataFrame
+    new_vals = {
+        'Publisher':   cv_data['publisher'],
+        'Published':   cv_data['published'],
+        'KeyIssue':    cv_data['key_issue'],
+        'Cover Price': cv_data['cover_price'],
+        'Comic Age':   cv_data['comic_age'],
+        'Notes':       cv_data['notes'],
+        'Confidence':  round(cv_data['confidence'], 4),
+        'Cover Image': cv_data['cover_image'],
+        'Book Link':   cv_data['book_link'],
+        ID_DATE_COL:   rundate,
+    }
+    for col, val in new_vals.items():
+        sorted_df.at[index, col] = val
+
+    # Queue for sheet write
+    sheet_row = _sheet_row(index)
+    pending[sheet_row] = {
+        col_index[col]: val
+        for col, val in new_vals.items()
+        if col in col_index
+    }
 
     fixed += 1
 
+    # Checkpoint every CHECKPOINT_EVERY fixed rows
+    if fixed % CHECKPOINT_EVERY == 0:
+        flush_pending(pending, worksheet, label=f"after {fixed} fixed")
+
 # ---------------------------------------------------------------------------
-#  Write back
+#  Final flush
 # ---------------------------------------------------------------------------
 print(f"\nResults: {fixed} fixed, {skipped} skipped (no match), {failed} errors")
-print("Writing to Google Sheet...")
-
-safe_fillna(sorted_df)
-worksheet.update([sorted_df.columns.values.tolist()] + sorted_df.values.tolist())
+if pending:
+    print("Writing final checkpoint to Google Sheet...")
+    flush_pending(pending, worksheet, label="final")
 
 print("Done.")
