@@ -101,7 +101,21 @@ def _sheet_row(df_index):
     # sorted_df positions map back to original df positions; sheet row = original df index + 2
     return df_index + 2
 
-def flush_pending(pending, worksheet, label=''):
+def send_whatsapp(msg):
+    """Fire a WhatsApp message to Chris via openclaw CLI."""
+    import subprocess
+    try:
+        subprocess.run(
+            ['openclaw', 'message', 'send',
+             '--channel', 'whatsapp',
+             '--to', '+14079214706',
+             '--message', msg],
+            timeout=15, check=False
+        )
+    except Exception as e:
+        print(f"  [WA notify failed: {e}]")
+
+def flush_pending(pending, worksheet, label='', fixed_total=0, total=0):
     """Write all pending updates to the sheet in one batch call per row."""
     if not pending:
         return
@@ -113,14 +127,18 @@ def flush_pending(pending, worksheet, label=''):
     for attempt in range(3):
         try:
             worksheet.update_cells(cells, value_input_option='USER_ENTERED')
-            print(f"  ✓ Checkpoint{' '+label if label else ''}: {len(pending)} rows written to sheet")
+            msg = f"✅ Checkpoint: {len(pending)} rows written to sheet ({fixed_total}/{total} comics identified so far)"
+            print(f"  ✓ {msg}")
+            send_whatsapp(msg)
             pending.clear()
             return
         except Exception as e:
             wait = 10 * (attempt + 1)
             print(f"  Sheet write error (attempt {attempt+1}): {e} — retrying in {wait}s...")
             time.sleep(wait)
-    print("  ✗ Checkpoint write failed after 3 attempts — will retry at next checkpoint")
+    err_msg = f"⚠️ Checkpoint write FAILED after 3 attempts — {len(pending)} rows not saved yet"
+    print(f"  ✗ {err_msg}")
+    send_whatsapp(err_msg)
 
 for index, thisComic in target.iterrows():
     processed = fixed + skipped + failed
@@ -207,7 +225,7 @@ for index, thisComic in target.iterrows():
 
     # Checkpoint every CHECKPOINT_EVERY fixed rows
     if fixed % CHECKPOINT_EVERY == 0:
-        flush_pending(pending, worksheet, label=f"after {fixed} fixed")
+        flush_pending(pending, worksheet, label=f"after {fixed} fixed", fixed_total=fixed, total=len(target))
 
 # ---------------------------------------------------------------------------
 #  Final flush
@@ -215,6 +233,6 @@ for index, thisComic in target.iterrows():
 print(f"\nResults: {fixed} fixed, {skipped} skipped (no match), {failed} errors")
 if pending:
     print("Writing final checkpoint to Google Sheet...")
-    flush_pending(pending, worksheet, label="final")
+    flush_pending(pending, worksheet, label="final", fixed_total=fixed, total=len(target))
 
 print("Done.")
