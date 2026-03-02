@@ -78,7 +78,14 @@ fixed   = 0
 skipped = 0
 failed  = 0
 
+COOLDOWN_EVERY = 100   # pause every N comics to let CV rate limit recover
+COOLDOWN_SECS  = 60    # seconds to pause
+
 for index, thisComic in target.iterrows():
+    processed = fixed + skipped + failed
+    if processed > 0 and processed % COOLDOWN_EVERY == 0:
+        print(f"\n--- Cooldown pause {COOLDOWN_SECS}s after {processed} comics (CV rate limit) ---\n")
+        time.sleep(COOLDOWN_SECS)
     title   = str(thisComic['Title']).strip().upper()
     issue   = str(thisComic['Issue']).strip()
     variant = str(thisComic.get('Variant', '')).strip()

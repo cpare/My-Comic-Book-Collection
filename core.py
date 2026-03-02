@@ -25,8 +25,8 @@ EBAY_FINDING_PROD    = "https://svcs.ebay.com/services/search/FindingService/v1"
 EBAY_FINDING_SANDBOX = "https://svcs.sandbox.ebay.com/services/search/FindingService/v1"
 CV_HEADERS = {"User-Agent": "MyComicCollection/1.0"}
 CV_CONFIDENCE_THRESHOLD = 0.60   # Reject matches below this — prevents wrong-title pollution
-CV_REQUEST_DELAY        = 0.5    # Seconds to sleep between every CV API call (avoids 420s)
-CV_RETRY_DELAYS         = [5, 15, 30]  # Backoff delays (seconds) on HTTP 420 rate-limit
+CV_REQUEST_DELAY        = 1.5    # Seconds to sleep between every CV API call (avoids 420s)
+CV_RETRY_DELAYS         = [10, 30, 60]  # Backoff delays (seconds) on HTTP 420 rate-limit
 
 GRADE_SCALE = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5,
                5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0,
