@@ -21,6 +21,13 @@ ID_DATE_COL = 'Identification Date'  # Column name for CV identification trackin
 
 CV_BASE  = "https://comicvine.gamespot.com/api"
 
+# Volume cache: vol_id → list of issue results (avoids re-fetching same volume repeatedly)
+_volume_issue_cache = {}
+
+# Rate limit tracker: sliding window of request timestamps
+_cv_request_times = []
+CV_HOURLY_LIMIT   = 190  # Stay under the 200/hour hard limit with a safety margin
+
 EBAY_FINDING_PROD    = "https://svcs.ebay.com/services/search/FindingService/v1"
 EBAY_FINDING_SANDBOX = "https://svcs.sandbox.ebay.com/services/search/FindingService/v1"
 CV_HEADERS = {"User-Agent": "MyComicCollection/1.0"}
@@ -103,11 +110,33 @@ def safe_fillna(df):
 #   Comic Vine
 # =============================================================================
 
+def _cv_rate_limit_wait():
+    """
+    Enforce a sliding-window hourly rate limit of CV_HOURLY_LIMIT requests/hour.
+    Prunes timestamps older than 1 hour, then sleeps if we're at the cap.
+    """
+    global _cv_request_times
+    now = time.time()
+    # Drop timestamps older than 1 hour
+    _cv_request_times = [t for t in _cv_request_times if now - t < 3600]
+    if len(_cv_request_times) >= CV_HOURLY_LIMIT:
+        oldest = _cv_request_times[0]
+        wait   = 3600 - (now - oldest) + 1  # seconds until oldest drops off
+        print(f"     CV: Hourly limit reached ({CV_HOURLY_LIMIT} requests) — "
+              f"waiting {int(wait)}s for window to roll ({len(_cv_request_times)} in last hour)")
+        time.sleep(wait)
+        # Re-prune after sleeping
+        now = time.time()
+        _cv_request_times = [t for t in _cv_request_times if now - t < 3600]
+    _cv_request_times.append(time.time())
+
+
 def _cv_get(session, cv_api_key, endpoint, params):
     """Make a Comic Vine API call with rate-limit retry. Returns parsed results or None."""
     params.update({'api_key': cv_api_key, 'format': 'json'})
     url = f"{CV_BASE}/{endpoint}/"
     time.sleep(CV_REQUEST_DELAY)  # polite inter-request delay
+    _cv_rate_limit_wait()         # enforce hourly cap before every request
     for attempt, backoff in enumerate([0] + CV_RETRY_DELAYS):
         if backoff:
             print(f"     CV rate-limited — waiting {backoff}s before retry {attempt}...")
@@ -268,12 +297,18 @@ def SearchComicVine(session, cv_api_key, title, issue, variant='',
 
         if best_vol and best_vol_score >= 0.7:
             vol_id = best_vol.get('id')
-            print(f"     CV: Volume match '{best_vol.get('name')}' (id={vol_id}, {int(best_vol_score*100)}%) — fetching issues")
-            vol_issues = _cv_get(session, cv_api_key, 'issues', {
-                'filter': f'volume:{vol_id},issue_number:{issue}',
-                'field_list': field_list,
-                'limit': 10,
-            })
+            cache_key = f"{vol_id}:{issue}"
+            if cache_key in _volume_issue_cache:
+                vol_issues = _volume_issue_cache[cache_key]
+                print(f"     CV: Volume match '{best_vol.get('name')}' (id={vol_id}, {int(best_vol_score*100)}%) — using cached issues")
+            else:
+                print(f"     CV: Volume match '{best_vol.get('name')}' (id={vol_id}, {int(best_vol_score*100)}%) — fetching issues")
+                vol_issues = _cv_get(session, cv_api_key, 'issues', {
+                    'filter': f'volume:{vol_id},issue_number:{issue}',
+                    'field_list': field_list,
+                    'limit': 10,
+                })
+                _volume_issue_cache[cache_key] = vol_issues  # cache even if None
             if vol_issues:
                 vb, vs = _pick_best_match(
                     vol_issues, full_name,
@@ -310,16 +345,21 @@ def SearchComicVine(session, cv_api_key, title, issue, variant='',
     chars = best.get('character_credits') or []
     characters = ', '.join([c.get('name', '') for c in chars[:10]])
 
-    # Publisher requires a volume detail call
+    # Publisher requires a volume detail call (cached by vol_id to avoid repeat API hits)
     publisher = ''
     vol = best.get('volume') or {}
     vol_id = vol.get('id')
     if vol_id:
-        vol_data = _cv_get(session, cv_api_key,
-                           f"volume/4050-{vol_id}",
-                           {'field_list': 'publisher,name,start_year'})
-        if vol_data and isinstance(vol_data, dict):
-            publisher = (vol_data.get('publisher') or {}).get('name', '')
+        pub_cache_key = f"pub:{vol_id}"
+        if pub_cache_key in _volume_issue_cache:
+            publisher = _volume_issue_cache[pub_cache_key]
+        else:
+            vol_data = _cv_get(session, cv_api_key,
+                               f"volume/4050-{vol_id}",
+                               {'field_list': 'publisher,name,start_year'})
+            if vol_data and isinstance(vol_data, dict):
+                publisher = (vol_data.get('publisher') or {}).get('name', '')
+            _volume_issue_cache[pub_cache_key] = publisher
 
     return {
         'publisher':   publisher,
