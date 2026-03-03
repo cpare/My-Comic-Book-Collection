@@ -9,12 +9,15 @@ Usage:
     python3 reidentify.py              # re-identify first 100 comics (sorted order)
     python3 reidentify.py --limit 50   # first 50
     python3 reidentify.py --all        # entire sheet
+    python3 reidentify.py --all --resume  # skip rows already identified today
 """
 from __future__ import print_function
 import argparse
 import os
 import re
+import subprocess
 import sys
+import time
 
 from curl_cffi import requests
 from dotenv import load_dotenv
@@ -24,16 +27,19 @@ import pandas as pd
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 sys.path.insert(0, os.path.dirname(__file__))
 
-import time
 from core import SearchComicVine, safe_fillna, rundate, ID_DATE_COL
+
+OPENCLAW_BIN = os.path.expanduser('~/.npm-global/bin/openclaw')
+WA_TARGET    = '+14079214706'
 
 # ---------------------------------------------------------------------------
 #  Args
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser()
 group = parser.add_mutually_exclusive_group()
-group.add_argument('--limit', type=int, default=100, help='Number of comics to re-identify (default: 100)')
-group.add_argument('--all',   action='store_true',   help='Re-identify all comics in the sheet')
+group.add_argument('--limit',  type=int, default=100, help='Number of comics to re-identify (default: 100)')
+group.add_argument('--all',    action='store_true',   help='Re-identify all comics in the sheet')
+parser.add_argument('--resume', action='store_true',  help='Skip rows already identified today')
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -70,8 +76,16 @@ col_index = {name: i+1 for i, name in enumerate(headers)}
 
 sorted_df = df.sort_values(by=['Title', 'Volume', 'Issue'])
 
-limit = len(sorted_df) if args.all else args.limit
-target = sorted_df.head(limit)
+# --resume: skip rows already identified today
+if args.resume:
+    already_done = sorted_df[sorted_df[ID_DATE_COL].astype(str).str.strip() == rundate]
+    target_df = sorted_df[sorted_df[ID_DATE_COL].astype(str).str.strip() != rundate]
+    print(f"Resuming — skipping {len(already_done)} rows already identified today")
+else:
+    target_df = sorted_df
+
+limit  = len(target_df) if args.all else args.limit
+target = target_df.head(limit)
 
 print(f"Re-identifying {len(target)} comics (of {len(sorted_df)} total)...")
 print(f"Run date: {rundate}\n")
@@ -82,44 +96,41 @@ fixed   = 0
 skipped = 0
 failed  = 0
 
-COOLDOWN_EVERY  = 100  # pause every N comics to let CV rate limit recover
-COOLDOWN_SECS   = 60   # seconds to pause
-CHECKPOINT_EVERY = 250  # flush changes to Google Sheets every N fixed rows
+COOLDOWN_EVERY   = 100   # pause every N processed comics (CV rate limit)
+COOLDOWN_SECS    = 60    # seconds to pause
+CHECKPOINT_EVERY = 250   # flush pending sheet writes every N fixed rows
+STATUS_INTERVAL  = 1800  # send WA status every 30 minutes (seconds)
 
-# Columns we update on each identified row
-UPDATE_COLS = [
-    'Publisher', 'Published', 'KeyIssue', 'Cover Price',
-    'Comic Age', 'Notes', 'Confidence', 'Cover Image',
-    'Book Link', ID_DATE_COL,
-]
-
-# Track pending row updates: sheet_row (1-based) → list of (col_index, value)
-pending = {}  # sheet_row -> {col: value}
+# ---------------------------------------------------------------------------
+#  Helpers
+# ---------------------------------------------------------------------------
 
 def _sheet_row(df_index):
     """Convert DataFrame index to 1-based Google Sheet row (header is row 1)."""
-    # sorted_df positions map back to original df positions; sheet row = original df index + 2
     return df_index + 2
 
 def send_whatsapp(msg):
     """Fire a WhatsApp message to Chris via openclaw CLI."""
-    import subprocess
     try:
-        subprocess.run(
-            ['openclaw', 'message', 'send',
+        result = subprocess.run(
+            [OPENCLAW_BIN, 'message', 'send',
              '--channel', 'whatsapp',
-             '--to', '+14079214706',
+             '--to', WA_TARGET,
              '--message', msg],
-            timeout=15, check=False
+            timeout=20, check=False, capture_output=True, text=True
         )
+        if result.returncode != 0:
+            print(f"  [WA notify stderr: {result.stderr.strip()}]")
     except Exception as e:
         print(f"  [WA notify failed: {e}]")
 
-def flush_pending(pending, worksheet, label='', fixed_total=0, total=0):
-    """Write all pending updates to the sheet in one batch call per row."""
+# pending: sheet_row -> {col_idx: value}
+pending = {}
+
+def flush_pending(label=''):
+    """Write all pending updates to the sheet in one batch call."""
     if not pending:
         return
-    # Build a list of Cell objects for batch update
     cells = []
     for sheet_row, col_vals in pending.items():
         for col_idx, value in col_vals.items():
@@ -127,39 +138,57 @@ def flush_pending(pending, worksheet, label='', fixed_total=0, total=0):
     for attempt in range(3):
         try:
             worksheet.update_cells(cells, value_input_option='USER_ENTERED')
-            msg = f"✅ Checkpoint: {len(pending)} rows written to sheet ({fixed_total}/{total} comics identified so far)"
-            print(f"  ✓ {msg}")
-            send_whatsapp(msg)
+            print(f"  ✓ Checkpoint {label}: {len(pending)} rows written to sheet")
             pending.clear()
             return
         except Exception as e:
             wait = 10 * (attempt + 1)
             print(f"  Sheet write error (attempt {attempt+1}): {e} — retrying in {wait}s...")
             time.sleep(wait)
-    err_msg = f"⚠️ Checkpoint write FAILED after 3 attempts — {len(pending)} rows not saved yet"
-    print(f"  ✗ {err_msg}")
-    send_whatsapp(err_msg)
+    print(f"  ✗ Checkpoint write FAILED after 3 attempts")
+
+# ---------------------------------------------------------------------------
+#  Main loop
+# ---------------------------------------------------------------------------
+start_time       = time.time()
+last_status_time = start_time
 
 for index, thisComic in target.iterrows():
     processed = fixed + skipped + failed
+
+    # CV cooldown pause every 100 processed
     if processed > 0 and processed % COOLDOWN_EVERY == 0:
-        print(f"\n--- Cooldown pause {COOLDOWN_SECS}s after {processed} comics (CV rate limit) ---\n")
+        print(f"\n--- Cooldown pause {COOLDOWN_SECS}s after {processed} comics ---\n")
         time.sleep(COOLDOWN_SECS)
+
+    # 30-minute WA status update
+    now = time.time()
+    if now - last_status_time >= STATUS_INTERVAL:
+        elapsed_min = int((now - start_time) / 60)
+        remaining   = len(target) - processed
+        msg = (f"⏱ Status update ({elapsed_min}min elapsed): "
+               f"{processed}/{len(target)} processed, "
+               f"{fixed} fixed, {skipped} skipped, {failed} errors. "
+               f"~{remaining} remaining.")
+        print(f"\n{msg}\n")
+        send_whatsapp(msg)
+        last_status_time = now
+
     title   = str(thisComic['Title']).strip().upper()
     issue   = str(thisComic['Issue']).strip()
     variant = str(thisComic.get('Variant', '')).strip()
     variant = '' if variant in ('nan', 'None') else variant
 
     existing_publisher = str(thisComic.get('Publisher', '')).strip()
-    raw_volume = str(thisComic.get('Volume', '')).strip()
-    vol_match  = re.search(r'\d+', raw_volume)
+    raw_volume  = str(thisComic.get('Volume', '')).strip()
+    vol_match   = re.search(r'\d+', raw_volume)
     volume_number = int(vol_match.group()) if vol_match else None
 
     existing_book_link = str(thisComic.get('Book Link', '')).strip()
     existing_book_link = '' if existing_book_link in ('nan', 'None') else existing_book_link
 
     fullName = f"{title} #{issue}{variant}"
-    print(f"[{fixed+skipped+failed+1}/{len(target)}] {fullName}")
+    print(f"[{processed+1}/{len(target)}] {fullName}")
 
     try:
         cv_data = SearchComicVine(
@@ -181,23 +210,23 @@ for index, thisComic in target.iterrows():
         continue
 
     # Show what's changing
-    old_link = existing_book_link or sorted_df.at[index, 'Book Link']
+    old_link = existing_book_link
     new_link = cv_data['book_link']
     if old_link != new_link:
         print(f"     Book Link: {old_link}")
         print(f"           → : {new_link}")
 
-    old_pub = sorted_df.at[index, 'Publisher']
-    new_pub = cv_data['publisher']
+    old_pub  = str(thisComic.get('Publisher', '')).strip()
+    new_pub  = cv_data['publisher']
     if old_pub != new_pub:
         print(f"     Publisher: '{old_pub}' → '{new_pub}'")
 
-    old_date = sorted_df.at[index, 'Published']
+    old_date = str(thisComic.get('Published', '')).strip()
     new_date = cv_data['published']
-    if str(old_date) != str(new_date):
+    if old_date != str(new_date):
         print(f"     Published: '{old_date}' → '{new_date}'")
 
-    # Stage corrections in DataFrame
+    # Stage corrections
     new_vals = {
         'Publisher':   cv_data['publisher'],
         'Published':   cv_data['published'],
@@ -225,14 +254,18 @@ for index, thisComic in target.iterrows():
 
     # Checkpoint every CHECKPOINT_EVERY fixed rows
     if fixed % CHECKPOINT_EVERY == 0:
-        flush_pending(pending, worksheet, label=f"after {fixed} fixed", fixed_total=fixed, total=len(target))
+        flush_pending(label=f"{fixed} fixed")
 
 # ---------------------------------------------------------------------------
-#  Final flush
+#  Final flush + summary
 # ---------------------------------------------------------------------------
-print(f"\nResults: {fixed} fixed, {skipped} skipped (no match), {failed} errors")
+elapsed_min = int((time.time() - start_time) / 60)
+print(f"\nResults: {fixed} fixed, {skipped} skipped, {failed} errors ({elapsed_min}min)")
+
 if pending:
-    print("Writing final checkpoint to Google Sheet...")
-    flush_pending(pending, worksheet, label="final", fixed_total=fixed, total=len(target))
+    flush_pending(label="final")
 
-print("Done.")
+done_msg = (f"🏁 reidentify.py complete! "
+            f"{fixed} fixed, {skipped} skipped, {failed} errors in {elapsed_min} min.")
+print(done_msg)
+send_whatsapp(done_msg)
